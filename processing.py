@@ -233,7 +233,7 @@ def create_polygon(shape: Tuple[int], vertices: np.ndarray) -> np.ndarray:
     return base_array
 
 
-def point_inside_polygon(x: int, y: int, poly: list[tuple(int, int)] , include_edges: bool = True) -> bool:
+def point_inside_polygon(x: int, y: int, poly: list[tuple[int, int]], include_edges: bool = True) -> bool:
     '''
     Test if point (x,y) is inside polygon poly
 

@@ -22,6 +22,7 @@ import cv2
 
 import neoapi
 
+from camera import Camera
 from camera_web import CameraWeb
 from camera_baumer import CameraBaumer
 
