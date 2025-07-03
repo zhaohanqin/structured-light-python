@@ -11,47 +11,47 @@ class Camera(ABC):
     @abstractmethod
     def get_available_cameras(cameras_num_to_find:int=2) -> list[Camera]:
         '''
-        Get list of available cameras
+        获取可用相机列表
         
-        Args:
-            cameras_num_to_find (int) = 2 : The number of cameras to try to find 
+        参数:
+            cameras_num_to_find (int) = 2 : 尝试查找的相机数量
 
-        Returns:
-            cameras (list of Camera): list of founded cameras
+        返回:
+            cameras (list of Camera): 找到的相机列表
         '''
 
     @abstractmethod
     def get_image(self) -> np.array:
         '''
-        Get image from camera
+        从相机获取图像
         
-        Returns:
-            image (numpy array): image as numpy array (2D or 3D depending on color mode)
+        返回:
+            image (numpy array): 图像作为numpy数组(取决于颜色模式为2D或3D)
         '''
     
     @abstractproperty
     def exposure(self):
-        '''Exposure'''
+        '''曝光值'''
     
     @exposure.setter
     @abstractmethod
     def exposure(self):
-        '''Set exposure'''
+        '''设置曝光值'''
 
     @abstractproperty
     def gain(self):
-        '''Gain'''
+        '''增益'''
 
     @gain.setter
     @abstractmethod
     def gain(self):
-        '''Set gain'''
+        '''设置增益'''
     
     @abstractproperty
     def gamma(self):
-        '''Gamma'''
+        '''伽马值'''
     
     @gamma.setter
     @abstractmethod
     def gamma(self):
-        '''Set gamma'''
+        '''设置伽马值'''

@@ -1,4 +1,4 @@
-'''Module to store FPP data structures'''
+'''FPP数据结构模块'''
 
 from __future__ import annotations
 from typing import Optional
@@ -10,7 +10,7 @@ import numpy as np
 
 
 class PhaseShiftingAlgorithm(enum.IntEnum):
-    '''Enum for phase shift algorithm type'''
+    '''相移算法类型枚举'''
     n_step = 1
     double_three_step = 2
 
@@ -18,13 +18,13 @@ class PhaseShiftingAlgorithm(enum.IntEnum):
 @dataclass
 class CameraMeasurement:
     '''
-    Class to store result of measurement for one camera
+    存储单个相机测量结果的类
     '''
     fringe_orientation: Optional[str] = 'vertical'    
     imgs_list: Optional[list[list[np.ndarray]]] = field(default_factory=lambda:list())
     imgs_file_names: Optional[list[list[str]]] = field(default_factory=lambda:list())
 
-    # Calculated attributes
+    # 计算属性
     phases: Optional[list[np.ndarray]] = field(init=False)
     unwrapped_phases: Optional[list[np.ndarray]] = field(init=False)
     average_intensities: Optional[list[np.ndarray]] = field(init=False)
@@ -38,7 +38,7 @@ class CameraMeasurement:
 @dataclass
 class FPPMeasurement:
     '''
-    Class to store FPP measurement data    
+    存储FPP测量数据的类    
     '''
     phase_shifting_type: PhaseShiftingAlgorithm
     frequencies: list[float]

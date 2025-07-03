@@ -1,4 +1,4 @@
-'''Module for Projector class'''
+'''投影仪控制模块'''
 from __future__ import annotations
 
 import cv2
@@ -9,110 +9,192 @@ import config
 
 class Projector():
     '''
-    Class to control projector during experiment
+    投影仪控制类
+    
+    用于控制投影仪投影图案，包括窗口创建、图像校正和投影
     '''
-    def __init__(self, width: int, height: int, min_brightness: float = 0, max_brightness: float = 255):
-        self.width = width
-        self.height = height
-        self.__min_image_brightness = min_brightness
-        self.__max_image_brightness = max_brightness
-        self.window_exist: bool = False
-
-    def set_up_window(self) -> None:
+    def __init__(self, min_brightness=0.0, max_brightness=1.0, gamma_a=1.0, gamma_b=2.2, gamma_c=0.0):
         '''
-        Open new window thru OpenCV GUI and show it on second extended screen
+        初始化投影仪控制对象
+        
+        参数:
+            min_brightness (float): 投影图像的最小亮度 (0.0-1.0)
+            max_brightness (float): 投影图像的最大亮度 (0.0-1.0)
+            gamma_a (float): 伽马校正参数a
+            gamma_b (float): 伽马校正参数b
+            gamma_c (float): 伽马校正参数c
         '''
-        cv2.namedWindow('Projector window', cv2.WND_PROP_FULLSCREEN)
-        cv2.setWindowProperty('Projector window', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        # TODO: remove magic number 1920 with screen resolution for multimonitor case
-        # https://stackoverflow.com/questions/3129322/how-do-i-get-monitor-resolution-in-python
-        cv2.moveWindow('Projector window', config.PROJECTOR_WINDOW_SHIFT, 0)
-        self.window_exist = True
-
-    def project_pattern(self, pattern: np.ndarray, correction: bool = True) -> None:
+        # 保存参数
+        self.min_image_brightness = min_brightness
+        self.max_image_brightness = max_brightness
+        self.gamma_a = gamma_a
+        self.gamma_b = gamma_b
+        self.gamma_c = gamma_c
+        
+        # 窗口名称
+        self.window_name = "Projector"
+        
+        # 窗口是否已创建
+        self.window_created = False
+    
+    def set_up_window(self):
+        '''创建投影窗口'''
+        # 创建窗口
+        cv2.namedWindow(self.window_name, cv2.WND_PROP_FULLSCREEN)
+        # 将窗口移动到投影仪显示器
+        cv2.moveWindow(self.window_name, config.PROJECTOR_WINDOW_SHIFT, 0)
+        # 设置窗口为全屏
+        cv2.setWindowProperty(self.window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        
+        # 更新窗口状态
+        self.window_created = True
+    
+    def close_window(self):
+        '''关闭投影窗口'''
+        if self.window_created:
+            cv2.destroyWindow(self.window_name)
+            self.window_created = False
+    
+    def project_pattern(self, pattern):
         '''
-        Project pattern thru OpenCV GUI window, before projection pattern is intensity corrected
-
-        Args:
-            pattern (numpy array): image to project with OpenCV imshow method
-            correction (bool): do intensity correction before project pattern
+        投影图案
+        
+        参数:
+            pattern: 要投影的图案，可以是灰度图或彩色图
         '''
-        # Open OpenCV GUI window, if it is has not been already opened
-        if not self.window_exist:
+        # 如果窗口未创建，先创建窗口
+        if not self.window_created:
             self.set_up_window()
         
-        # Correct image with calibration coefficients
-        if correction:
-            self._corrected_pattern = self.image_brightness_rescale_factor * ((pattern / config.PROJECTOR_GAMMA_A) ** (1 / config.PROJECTOR_GAMMA_B)) + self.min_image_brightness
+        # 应用亮度校正
+        pattern_corrected = self._correct_image_brightness(pattern)
+        
+        # 显示图案
+        cv2.imshow(self.window_name, pattern_corrected)
+        cv2.waitKey(1)
+    
+    def _correct_image_brightness(self, image):
+        '''
+        校正图像亮度
+        
+        参数:
+            image: 输入图像
+        
+        返回:
+            corrected_image: 校正后的图像
+        '''
+        # 将图像转换为浮点型
+        image_float = image.astype(np.float32)
+        
+        # 如果是彩色图像
+        if len(image.shape) == 3:
+            # 归一化到0-1范围
+            image_float = image_float / 255.0
+            
+            # 应用伽马校正: a * (x + c) ^ b
+            corrected = self.gamma_a * np.power(image_float + self.gamma_c, self.gamma_b)
+            
+            # 应用亮度范围校正
+            corrected = self.min_image_brightness + corrected * (self.max_image_brightness - self.min_image_brightness)
+            
+            # 裁剪到0-1范围
+            corrected = np.clip(corrected, 0.0, 1.0)
+            
+            # 转换回8位无符号整数
+            return (corrected * 255).astype(np.uint8)
+        # 如果是灰度图像
         else:
-            self._corrected_pattern = pattern
-        # Show image at OpenCV GUI window
-        cv2.imshow('Projector window', self._corrected_pattern)
+            # 归一化到0-1范围
+            image_float = image_float / 255.0
+            
+            # 应用伽马校正: a * (x + c) ^ b
+            corrected = self.gamma_a * np.power(image_float + self.gamma_c, self.gamma_b)
+            
+            # 应用亮度范围校正
+            corrected = self.min_image_brightness + corrected * (self.max_image_brightness - self.min_image_brightness)
+            
+            # 裁剪到0-1范围
+            corrected = np.clip(corrected, 0.0, 1.0)
+            
+            # 转换回8位无符号整数
+            return (corrected * 255).astype(np.uint8)
 
     def project_black_background(self) -> None:
         '''
-        Project black pattern thru OpenCV GUI window for projector off emulation
+        通过OpenCV GUI窗口投影黑色图案，用于模拟投影仪关闭状态
         '''
-        # Open OpenCV GUI window, if it is has not been already opened
-        if not self.window_exist:
+        # 如果窗口尚未打开，则打开OpenCV GUI窗口
+        if not self.window_created:
             self.set_up_window()
         
-        # Create black bakground image
-        background = np.zeros((self.height, self.width))
+        # 创建黑色背景图像(全零矩阵)
+        background = np.zeros((config.PROJECTOR_HEIGHT, config.PROJECTOR_WIDTH))
         
-        # Show image at OpenCV GUI window
-        cv2.imshow('Projector window', background)
-        cv2.waitKey(200)
+        # 在OpenCV GUI窗口显示图像
+        cv2.imshow(self.window_name, background)
+        cv2.waitKey(200)  # 等待200毫秒，确保显示
 
     def project_white_background(self) -> None:
         '''
-        Project white pattern thru OpenCV GUI window for using projector as light source
+        通过OpenCV GUI窗口投影白色图案，用于将投影仪用作光源
         '''
-        # Open OpenCV GUI window, if it is has not been already opened
-        if not self.window_exist:
+        # 如果窗口尚未打开，则打开OpenCV GUI窗口
+        if not self.window_created:
             self.set_up_window()
         
-        # Create black bakground image
-        background = np.ones((self.height, self.width)) * 255
+        # 创建白色背景图像(全255矩阵)
+        background = np.ones((config.PROJECTOR_HEIGHT, config.PROJECTOR_WIDTH)) * 255
         
-        # Show image at OpenCV GUI window
-        cv2.imshow('Projector window', background)
-        cv2.waitKey(200)
-
-    def close_window(self) -> None:
-        '''
-        Close opened OpenCV GUI window on second extended screen
-        '''
-        cv2.destroyWindow('Projector window')
-        self.window_exist = False
+        # 在OpenCV GUI窗口显示图像
+        cv2.imshow(self.window_name, background)
+        cv2.waitKey(200)  # 等待200毫秒，确保显示
 
     @property
     def corrected_pattern(self) -> np.ndarray:
         '''
-        Return last projected corrected pattern as numpy array
+        返回最后一次投影的校正后图案作为numpy数组
         '''
-        return self._corrected_pattern
+        return self._correct_image_brightness(np.zeros((config.PROJECTOR_HEIGHT, config.PROJECTOR_WIDTH)))
 
     @property
     def resolution(self) -> tuple[int, int]:
-        return self.width, self.height
+        '''
+        返回投影仪分辨率(宽度和高度)
+        '''
+        return config.PROJECTOR_WIDTH, config.PROJECTOR_HEIGHT
 
     @property
     def min_image_brightness(self) -> float:
-        return self.__min_image_brightness
+        '''
+        获取最小图像亮度值
+        '''
+        return self.min_image_brightness
 
     @min_image_brightness.setter
     def min_image_brightness(self, value: float):
-        self.__min_image_brightness = value
+        '''
+        设置最小图像亮度值
+        '''
+        self.min_image_brightness = value
 
     @property
     def max_image_brightness(self) -> float:
-        return self.__max_image_brightness
+        '''
+        获取最大图像亮度值
+        '''
+        return self.max_image_brightness
 
     @max_image_brightness.setter
     def max_image_brightness(self, value: float):
-        self.__max_image_brightness = value
+        '''
+        设置最大图像亮度值
+        '''
+        self.max_image_brightness = value
 
     @property
     def image_brightness_rescale_factor(self) -> float:
+        '''
+        计算图像亮度重缩放因子(最大亮度与最小亮度之差)
+        用于亮度校正过程
+        '''
         return (self.max_image_brightness - self.min_image_brightness)
