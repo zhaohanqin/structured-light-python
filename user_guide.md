@@ -25,13 +25,15 @@
    - 如使用Baumer相机，需安装neoapi
 
 2. 克隆项目仓库到本地：
-   ```
+
+   ```bash
    git clone [项目仓库URL]
    cd structured-light-python
    ```
 
 3. 安装依赖：
-   ```
+
+   ```bash
    pip install -r requirements.txt
    ```
 
@@ -52,7 +54,8 @@
 ### 2. 系统初始化与配置
 
 1. **启动系统**：
-   ```
+
+   ```bash
    python main.py
    ```
 
@@ -179,4 +182,4 @@
 
 - 项目文档
 - 代码注释
-- 相关论文与参考文献 
+- 相关论文与参考文献
