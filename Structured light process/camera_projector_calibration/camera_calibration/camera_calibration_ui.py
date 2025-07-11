@@ -367,7 +367,9 @@ class CameraCalibrationWindow(QMainWindow):
         folder_layout = QHBoxLayout()
         self.images_folder_edit = QLineEdit()
         self.images_folder_edit.setPlaceholderText("标定图像所在文件夹路径")
+        self.images_folder_edit.setToolTip("请选择包含多张从不同角度拍摄的标定板图像的文件夹。")
         browse_button = StylishButton("浏览...", primary=False)
+        browse_button.setToolTip("点击浏览并选择包含标定图像的文件夹。")
         browse_button.clicked.connect(self._browse_images_folder)
         folder_layout.addWidget(self.images_folder_edit, 7)
         folder_layout.addWidget(browse_button, 1)
@@ -405,6 +407,7 @@ class CameraCalibrationWindow(QMainWindow):
         self.board_type_combo.addItem("圆形标定板 (白底黑圆)", "circles")
         self.board_type_combo.addItem("空心圆环标定板", "ring_circles")
         self.board_type_combo.currentIndexChanged.connect(self._update_board_tips)
+        self.board_type_combo.setToolTip("选择您使用的标定板类型。\n- 棋盘格: 最常用，精度高。\n- 圆形: 对光照变化不敏感。\n- 空心圆环: 适合高反光表面。")
         
         board_type_layout.addWidget(QLabel("标定板类型:"))
         board_type_layout.addWidget(self.board_type_combo)
@@ -438,17 +441,20 @@ class CameraCalibrationWindow(QMainWindow):
         self.board_width = QSpinBox()
         self.board_width.setRange(2, 20)
         self.board_width.setValue(9)
+        self.board_width.setToolTip("标定板上水平方向的内角点或圆心数量。\n例如，一个9x6的棋盘格，水平点数是9。")
         
         # 垂直点数
         self.board_height = QSpinBox()
         self.board_height.setRange(2, 20)
         self.board_height.setValue(6)
+        self.board_height.setToolTip("标定板上垂直方向的内角点或圆心数量。\n例如，一个9x6的棋盘格，垂直点数是6。")
         
         # 实际尺寸
         self.square_size = QDoubleSpinBox()
         self.square_size.setRange(1, 1000)
         self.square_size.setValue(20.0)
         self.square_size.setSuffix(" mm")
+        self.square_size.setToolTip("标定板上单个方格的边长，或相邻圆心的距离（单位：毫米）。\n这个值的准确性直接影响标定结果的尺度。")
         
         board_size_layout.addRow("水平点数:", self.board_width)
         board_size_layout.addRow("垂直点数:", self.board_height)
@@ -469,6 +475,7 @@ class CameraCalibrationWindow(QMainWindow):
         viz_layout = QHBoxLayout()
         self.show_corners_check = QCheckBox("显示检测到的角点")
         self.show_corners_check.setChecked(True)
+        self.show_corners_check.setToolTip("如果选中，在标定过程中会实时弹窗显示每张图像上检测到的角点或圆心，方便检查检测效果。")
         
         viz_layout.addWidget(self.show_corners_check)
         viz_layout.addStretch()
@@ -484,9 +491,11 @@ class CameraCalibrationWindow(QMainWindow):
         buttons_layout = QHBoxLayout()
         
         self.calibrate_button = StylishButton("执行标定")
+        self.calibrate_button.setToolTip("点击开始使用选定的图像和参数进行相机标定。")
         self.calibrate_button.clicked.connect(self._run_calibration)
         
         self.test_button = StylishButton("测试畸变校正", primary=False)
+        self.test_button.setToolTip("标定完成后，点击此按钮并选择一张图片，以预览畸变校正的效果。")
         self.test_button.clicked.connect(self._test_undistortion)
         self.test_button.setEnabled(False)  # 初始状态下禁用
         

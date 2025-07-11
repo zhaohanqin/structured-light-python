@@ -113,22 +113,27 @@ def compute_wrapped_phase(images: List[np.ndarray], algorithm: PhaseShiftingAlgo
         wrapped_phase = np.arctan2(numerator, denominator)
         
     elif algorithm == PhaseShiftingAlgorithm.n_step:
-        # N步相移算法 (最小二乘法)
+        # N步相移算法 (傅里叶变换法)
         n = len(float_images)
-        
+        if n == 0:
+            raise ValueError("用于计算包裹相位的图像列表不能为空。")
+
         # 计算相移步长
         delta = 2 * np.pi / n
         
-        # 计算分子和分母
-        numerator = 0
-        denominator = 0
+        # 使用向量化操作计算分子和分母
+        indices = np.arange(n)
+        phase_shifts = indices * delta
         
-        for i in range(n):
-            phase_shift = i * delta
-            numerator += float_images[i] * np.sin(phase_shift)
-            denominator += float_images[i] * np.cos(phase_shift)
+        sin_coeffs = np.sin(phase_shifts).reshape(n, 1, 1)
+        cos_coeffs = np.cos(phase_shifts).reshape(n, 1, 1)
+
+        image_stack = np.stack(float_images, axis=0)
+
+        numerator = np.sum(image_stack * sin_coeffs, axis=0)
+        denominator = np.sum(image_stack * cos_coeffs, axis=0)
             
-        wrapped_phase = np.arctan2(numerator, denominator)
+        wrapped_phase = np.arctan2(-numerator, denominator)
     
     else:
         raise ValueError(f"不支持的相移算法: {algorithm}")
@@ -1431,13 +1436,72 @@ def calibrate_projector_with_camera_global(self, camera_matrix, camera_distortio
     
     return self.projector_matrix, self.projector_dist, self.R, self.T, proj_error
 
-def phase_based_projector_calibration(projector_width, projector_height, camera_params_file,
-                                   phase_images_folder, board_type="chessboard", chessboard_size=(9, 6), 
-                                   square_size=20.0, output_folder=None, visualize=True, 
-                                   global_optimization=True, sampling_step=5, adaptive_threshold=True):
+def process_n_step_images_integrated(image_paths: List[str], output_dir: str, 
+                                     show_plots: bool = True, return_quality: bool = False):
     """
-    使用相位解包裹方法进行投影仪标定
+    处理N步相移图像并生成解包裹相位 (通用版本)
     
+    参数:
+        image_paths: N张相移图像的路径列表
+        output_dir: 输出目录
+        show_plots: 是否显示图形
+        return_quality: 是否返回相位质量图
+    
+    返回:
+        unwrapped_phase: 解包裹相位图
+        quality_map: 相位质量图
+        wrapped_phase: 包裹相位图
+        base_image: 用于角点检测的基准图像 (平均强度图)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    images = [cv2.imread(path, cv2.IMREAD_GRAYSCALE) for path in image_paths]
+    if any(img is None for img in images):
+        img_path_str = "\n".join(image_paths)
+        raise ValueError(f"无法加载一张或多张图像，请检查路径:\n{img_path_str}")
+    
+    n_steps = len(images)
+    if n_steps < 3:
+        raise ValueError(f"N步相移至少需要3张图像，但收到了{n_steps}张")
+
+    # 计算平均强度图作为基准图
+    base_image = np.mean(np.stack([img.astype(np.float32) for img in images], axis=0), axis=0).astype(np.uint8)
+
+    wrapped_phase = compute_wrapped_phase(images, PhaseShiftingAlgorithm.n_step)
+    quality_map = compute_phase_quality(images)
+    
+    visualize_phase(wrapped_phase, "Wrapped Phase", os.path.join(output_dir, "wrapped_phase.png"), 
+                    show_plots, True, quality_map)
+    
+    unwrapped_phase = quality_guided_unwrap(wrapped_phase, quality_map)
+    
+    visualize_phase(unwrapped_phase, "Unwrapped Phase", os.path.join(output_dir, "unwrapped_phase.png"), 
+                    show_plots, False)
+    
+    np.save(os.path.join(output_dir, "wrapped_phase.npy"), wrapped_phase)
+    np.save(os.path.join(output_dir, "unwrapped_phase.npy"), unwrapped_phase)
+    np.save(os.path.join(output_dir, "quality_map.npy"), quality_map)
+    
+    print(f"{n_steps}步相移处理完成。结果已保存到 {output_dir} 目录。")
+    
+    if return_quality:
+        return unwrapped_phase, quality_map, wrapped_phase, base_image
+    return unwrapped_phase, None, wrapped_phase, base_image
+
+def phase_based_projector_calibration(projector_width, projector_height, camera_params_file,
+                                   phase_images_folder, board_type="chessboard", chessboard_size=(9, 6),
+                                   square_size=20.0, output_folder=None, visualize=True,
+                                   global_optimization=True, sampling_step=5, adaptive_threshold=True,
+                                   n_steps=4, print_func=print):
+    """
+    基于相位解包裹的投影仪标定主函数 (新版，支持N步相移和子文件夹)
+
+    通过处理包含多个子文件夹的图像目录来进行投影仪标定，每个子文件夹代表一个标定姿态。
+    每个子文件夹内应包含 2*N 张图像 (N为相移步数):
+    - I1 ... IN: 水平方向的N步相移图像
+    - I(N+1) ... I(2N): 垂直方向的N步相移图像
+    (支持 .png, .jpg, .jpeg, .bmp, .tif, .tiff 格式)
+
     参数:
         projector_width: 投影仪分辨率宽度
         projector_height: 投影仪分辨率高度
@@ -1451,195 +1515,221 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
         global_optimization: 是否使用全局优化方法提高精度
         sampling_step: 从相位图中提取对应关系的采样步长
         adaptive_threshold: 是否使用自适应方法计算质量阈值
-        
-    返回:
-        calibration: 投影仪标定对象
-        calibration_file: 保存的标定文件路径
-        
-    异常:
-        PhaseUnwrappingError: 相位解包裹失败
-        BoardDetectionError: 标定板检测失败
-        CorrespondenceError: 无法建立足够的点对应关系
-        CalibrationError: 其他标定过程中的错误
+        n_steps: 相移步数 (N), 默认为4.
+        print_func: 用于打印消息的函数，默认为print。
     """
-    try:
-        # 创建输出文件夹
-        if output_folder is None:
-            output_folder = os.path.join(phase_images_folder, "projector_calibration_results")
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-            
-        # 创建日志文件
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(output_folder, f"calibration_log_{timestamp}.txt")
+    print_func(f"投影仪标定程序 (基于相位解包裹 - v2.1 支持N步相移)")
+    print_func("=" * 60)
 
-        # 创建投影仪标定对象
-        calibration = ProjectorCalibration(
-            projector_width, projector_height, log_file=log_file
-        )
-        
-        calibration.log(f"开始投影仪标定 - 时间: {timestamp}")
-        calibration.log(f"投影仪分辨率: {projector_width}x{projector_height}")
-        calibration.log(f"使用标定板类型: {board_type}, 尺寸: {chessboard_size}, 方格大小: {square_size}mm")
-        calibration.log(f"相位图文件夹: {phase_images_folder}")
-        
-        # 加载相机参数
-        camera_matrix, camera_dist = calibration.load_camera_params(camera_params_file)
-        
-        try:
-            # 处理相移图案图像，获取解包裹相位
-            calibration.log("\n处理相移图案图像，进行相位解包裹...")
-            unwrapped_results = process_phase_images(
-                phase_images_folder, 
-                output_dir=os.path.join(output_folder, "phase_unwrapping"),
-                visualize=visualize,
-                adaptive_threshold=adaptive_threshold
-            )
-        except Exception as e:
-            raise PhaseUnwrappingError(f"相位解包裹失败: {str(e)}")
-        
-        try:
-            # 从相位图中提取投影仪-相机像素对应关系
-            calibration.log("\n从相位图提取投影仪-相机像素对应关系...")
-            correspondences = extract_phase_correspondence(
-                unwrapped_results.get("horizontal"), 
-                unwrapped_results.get("vertical"),
-                projector_width,
-                projector_height,
-                sampling_step=sampling_step
-            )
-            
-            if not correspondences:
-                raise CorrespondenceError("未能从相位图中提取有效的像素对应关系")
-        except Exception as e:
-            if isinstance(e, CorrespondenceError):
-                raise
-            else:
-                raise CorrespondenceError(f"提取像素对应关系失败: {str(e)}")
-        
-        try:
-            # 找到标定板位置
-            calibration.log("\n检测标定板位置...")
-            # 使用第一张相移图像来检测标定板
-            if "horizontal" in unwrapped_results:
-                reference_image_path = sorted(glob.glob(os.path.join(phase_images_folder, "h_*.png")))[0]
-            else:
-                reference_image_path = sorted(glob.glob(os.path.join(phase_images_folder, "v_*.png")))[0]
-                
-            reference_image = cv2.imread(reference_image_path)
-            if reference_image is None:
-                raise BoardDetectionError(f"无法读取参考图像: {reference_image_path}")
-            
-            board_points, board_corners = detect_calibration_board(
-                reference_image, board_type, chessboard_size, square_size
-            )
-            
-            if board_points is None or board_corners is None:
-                raise BoardDetectionError("无法在参考图像中检测到标定板")
-        except Exception as e:
-            if isinstance(e, BoardDetectionError):
-                raise
-            else:
-                raise BoardDetectionError(f"标定板检测失败: {str(e)}")
-        
-        # 将标定板角点与相位对应关系结合
-        calibration.log("\n将标定板角点与相位对应关系结合...")
-        
-        # 准备标定数据
-        calibration_points = []
-        
-        # 对于检测到的每个标定板角点
-        corner_iter = enumerate(board_corners)
-        if TQDM_AVAILABLE:
-            corner_iter = tqdm(corner_iter, total=len(board_corners), desc="处理标定板角点")
-            
-        for i, corner in corner_iter:
-            # 获取角点在图像中的位置（亚像素精度）
-            camera_x, camera_y = corner.ravel()
-            
-            # 使用双线性插值获取该亚像素位置的相位值
-            if "horizontal" in unwrapped_results and "vertical" in unwrapped_results:
-                h_unwrapped = unwrapped_results["horizontal"]
-                v_unwrapped = unwrapped_results["vertical"]
-                
-                # 使用双线性插值获取水平和垂直相位值
-                h_phase = bilinear_interpolate(h_unwrapped, camera_y, camera_x)
-                v_phase = bilinear_interpolate(v_unwrapped, camera_y, camera_x)
-                
-                # 获取相位最大值
-                h_max_phase = unwrapped_results["horizontal_max_phase"]
-                v_max_phase = unwrapped_results["vertical_max_phase"]
-                
-                # 计算对应的投影仪坐标
-                if h_phase > 0 and v_phase > 0:  # 确保相位值有效
-                    proj_x = (h_phase / h_max_phase) * projector_width
-                    proj_y = (v_phase / v_max_phase) * projector_height
-                    
-                    # 添加到标定点列表，保持亚像素精度
-                    calibration_points.append({
-                        'projector_point': np.array([proj_x, proj_y]),
-                        'camera_point': corner.ravel(),
-                        'board_index': i
-                    })
-                    
-                    if not TQDM_AVAILABLE:  # 如果没有进度条，则打印每个点的信息
-                        calibration.log(f"角点 {i}: 相机坐标 ({camera_x:.2f}, {camera_y:.2f}), "
-                              f"投影仪坐标 ({proj_x:.2f}, {proj_y:.2f})")
-            else:
-                calibration.log(f"警告: 角点 {i} 处无法进行插值，缺少完整的相位数据")
-                
-        if not calibration_points:
-            raise CorrespondenceError("未能建立有效的标定点对应关系")
-            
-        calibration.log(f"成功建立了 {len(calibration_points)} 个标定点对应关系")
-        
-        # 检查是否有足够的点用于标定
-        min_points_needed = 10  # 至少需要10个点进行可靠的标定
-        if len(calibration_points) < min_points_needed:
-            raise CorrespondenceError(f"标定点数量不足，需要至少{min_points_needed}个点，但只找到了{len(calibration_points)}个")
-        
-        try:
-            # 执行投影仪标定
-            calibration.log("\n执行投影仪标定...")
-            
-            if global_optimization:
-                calibration.log("使用全局优化方法进行标定...")
-                projector_matrix, projector_dist, R, T, reproj_error = calibration.calibrate_projector_with_camera_global(
-                    camera_matrix, camera_dist, calibration_points, board_points
-                )
-            else:
-                projector_matrix, projector_dist, R, T, reproj_error = calibration.calibrate_projector_with_camera(
-                    camera_matrix, camera_dist, calibration_points, board_points
-                )
-            
-            # 评估标定质量
-            assess_calibration_quality(reproj_error, board_type)
-            
-            # 保存标定结果
-            calibration_file = os.path.join(output_folder, f"projector_calibration_phase_{timestamp}.json")
-            calibration_file, default_file = calibration.save_calibration(calibration_file)
-            
-            # 记录完成信息
-            calibration.log("\n标定完成！")
-            calibration.log(f"标定结果已保存至: {calibration_file}")
-            calibration.log(f"标定精度 (重投影误差): {reproj_error:.4f} 像素")
-            
-            return calibration, calibration_file
-            
-        except Exception as e:
-            raise CalibrationError(f"执行标定失败: {str(e)}")
+    # 检查输入文件夹是否存在
+    if not os.path.isdir(phase_images_folder):
+        raise FileNotFoundError(f"指定的相位图像文件夹不存在: {phase_images_folder}")
+
+    # 创建输出文件夹
+    if output_folder is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_folder = os.path.join(phase_images_folder, f"projector_calibration_{timestamp}")
     
+    os.makedirs(output_folder, exist_ok=True)
+    phase_unwrap_dir = os.path.join(output_folder, "phase_unwrapping")
+    os.makedirs(phase_unwrap_dir, exist_ok=True)
+    
+    print_func(f"标定结果将保存至: {output_folder}")
+
+    # 初始化标定对象
+    calibration = ProjectorCalibration(projector_width, projector_height, log_file=os.path.join(output_folder, "calibration_log.txt"))
+
+    # 加载相机参数
+    print_func("\n步骤 1: 加载相机参数...")
+    try:
+        calib_data = calibration.load_camera_params(camera_params_file=camera_params_file)
+        camera_matrix = calib_data['camera_matrix']
+        camera_distortion = calib_data['dist_coeffs']
+        print_func(f"成功从 {camera_params_file} 加载相机参数。")
     except Exception as e:
-        # 捕获并重新抛出所有异常，确保它们得到适当处理
-        if isinstance(e, (PhaseUnwrappingError, BoardDetectionError, CorrespondenceError, CalibrationError)):
-            raise
-        else:
-            raise CalibrationError(f"投影仪标定过程中发生未预期的错误: {str(e)}")
+        raise CalibrationError(f"加载相机参数失败: {e}")
+
+    # 准备存储所有姿态的数据
+    all_obj_points = []     # 所有姿态的三维物体点
+    all_cam_points = []     # 所有姿态的相机图像点
+    all_proj_points = []    # 所有姿态的投影仪"图像"点 (相位坐标)
+
+    # 定义图像文件扩展名
+    IMG_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']
+
+    # 步骤 2 & 3: 遍历子文件夹，处理每个姿态
+    print_func("\n步骤 2 & 3: 循环处理每个姿态的图像，进行相位解包裹和角点检测...")
+    
+    pose_dirs = [d for d in os.listdir(phase_images_folder) if os.path.isdir(os.path.join(phase_images_folder, d))]
+    
+    if not pose_dirs:
+        raise FileNotFoundError(f"在 '{phase_images_folder}' 中未找到任何姿态子文件夹。")
+
+    valid_poses_count = 0
+    iterator = tqdm(pose_dirs, desc="处理姿态子文件夹", unit="pose") if TQDM_AVAILABLE else pose_dirs
+
+    for pose_name in iterator:
+        pose_dir = os.path.join(phase_images_folder, pose_name)
+        print_func(f"\n--- 正在处理姿态: {pose_name} ({n_steps}步相移) ---")
+
+        try:
+            # 查找 2*N 张图像
+            image_files = {}
+            total_images = 2 * n_steps
+            for i in range(1, total_images + 1):
+                found = False
+                for ext in IMG_EXTENSIONS:
+                    path = os.path.join(pose_dir, f"I{i}{ext}")
+                    if os.path.exists(path):
+                        image_files[f'I{i}'] = path
+                        found = True
+                        break
+                if not found:
+                    raise FileNotFoundError(f"在 {pose_dir} 中找不到图像 I{i} (需要1到{total_images}的图像)")
+
+            h_paths = [image_files[f'I{i}'] for i in range(1, n_steps + 1)]
+            v_paths = [image_files[f'I{i}'] for i in range(n_steps + 1, total_images + 1)]
+
+            # 为每个姿态创建单独的输出子目录
+            pose_output_dir = os.path.join(phase_unwrap_dir, pose_name)
+            os.makedirs(pose_output_dir, exist_ok=True)
+            h_output_dir = os.path.join(pose_output_dir, "horizontal")
+            v_output_dir = os.path.join(pose_output_dir, "vertical")
+
+            # 处理水平条纹
+            print_func("  - 解包裹水平相位...")
+            h_unwrapped, h_quality, _, _ = process_n_step_images_integrated(
+                h_paths, h_output_dir, show_plots=visualize, return_quality=True
+            )
+            
+            # 处理垂直条纹
+            print_func("  - 解包裹垂直相位...")
+            v_unwrapped, v_quality, _, base_image_v = process_n_step_images_integrated(
+                v_paths, v_output_dir, show_plots=visualize, return_quality=True
+            )
+
+            # 过滤低质量相位点
+            if adaptive_threshold:
+                print_func("  - 应用自适应阈值过滤低质量相位点...")
+                h_threshold = compute_adaptive_quality_threshold(h_quality)
+                v_threshold = compute_adaptive_quality_threshold(v_quality)
+                h_unwrapped[h_quality < h_threshold] = 0
+                v_unwrapped[v_quality < v_threshold] = 0
+
+            # 获取有效相位的动态范围
+            h_valid_mask = h_unwrapped != 0
+            v_valid_mask = v_unwrapped != 0
+            
+            if not np.any(h_valid_mask) or not np.any(v_valid_mask):
+                raise PhaseUnwrappingError("解包裹后的水平或垂直相位图为空，无法继续。请检查图像质量。")
+
+            h_min, h_max = np.min(h_unwrapped[h_valid_mask]), np.max(h_unwrapped[h_valid_mask])
+            v_min, v_max = np.min(v_unwrapped[v_valid_mask]), np.max(v_unwrapped[v_valid_mask])
+            
+            # 使用垂直相移的平均强度图进行角点检测
+            cam_img = base_image_v
+            if cam_img is None: # 如果处理函数没返回，就自己读一张
+                cam_img = cv2.imread(v_paths[0])
+            
+            # 检测标定板角点
+            print_func("  - 检测标定板角点...")
+            obj_points_pose, cam_points_pose = detect_calibration_board(cam_img, board_type, chessboard_size, square_size)
+            
+            if cam_points_pose is None or len(cam_points_pose) == 0:
+                raise BoardDetectionError(f"在姿态 {pose_name} 的图像中未能检测到标定板。")
+
+            print_func(f"  - 成功检测到 {len(cam_points_pose)} 个角点。")
+
+            # 提取投影仪中的对应点
+            proj_points_pose = []
+            for point in cam_points_pose:
+                x, y = point[0]
+                phi_h = bilinear_interpolate(h_unwrapped, y, x)
+                phi_v = bilinear_interpolate(v_unwrapped, y, x)
+                
+                # 检查插值后的相位是否有效
+                if phi_h != 0 and phi_v != 0:
+                    # 相位值到投影仪像素坐标的映射 (使用动态范围)
+                    px = (phi_h - h_min) / (h_max - h_min) * (projector_width - 1)
+                    py = (phi_v - v_min) / (v_max - v_min) * (projector_height - 1)
+                    proj_points_pose.append([px, py])
+            
+            if len(proj_points_pose) < len(cam_points_pose) * 0.8:
+                print_func(f"  - 警告: {len(cam_points_pose) - len(proj_points_pose)} 个角点位于无效相位区域，已被丢弃。")
+
+            if len(proj_points_pose) < 10: # 至少需要10个点
+                raise CorrespondenceError(f"在姿态 {pose_name} 中未能找到足够多的有效角点对应关系 (仅找到 {len(proj_points_pose)} 个)。")
+
+            proj_points_pose = np.array(proj_points_pose, dtype=np.float32).reshape(-1, 1, 2)
+            
+            # 由于部分角点可能被丢弃，需要筛选对应的相机点和物体点
+            valid_indices = [i for i, point in enumerate(cam_points_pose) 
+                             if bilinear_interpolate(h_unwrapped, point[0][1], point[0][0]) != 0 and 
+                                bilinear_interpolate(v_unwrapped, point[0][1], point[0][0]) != 0]
+
+            if len(valid_indices) != len(proj_points_pose):
+                 # 这是一个内部逻辑检查，正常不应触发
+                 raise Exception("内部错误：有效角点和投影仪点数量不匹配。")
+            
+            cam_points_pose_valid = cam_points_pose[valid_indices]
+            obj_points_pose_valid = obj_points_pose[valid_indices]
+
+            all_obj_points.append(obj_points_pose_valid)
+            all_cam_points.append(cam_points_pose_valid)
+            all_proj_points.append(proj_points_pose)
+            
+            valid_poses_count += 1
+            print_func(f"  - 姿态 {pose_name} 处理成功。")
+
+        except (FileNotFoundError, BoardDetectionError, PhaseUnwrappingError) as e:
+            print_func(f"警告: 跳过姿态 '{pose_name}'，原因: {e}")
+            continue
+        except Exception as e:
+            print_func(f"警告: 处理姿态 '{pose_name}' 时发生未知错误，已跳过。错误: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if valid_poses_count < 3:
+        raise CorrespondenceError(f"未能处理足够数量的有效姿态。至少需要3个有效姿态，但只处理了 {valid_poses_count} 个。")
+
+    print_func(f"\n成功处理了 {valid_poses_count} / {len(pose_dirs)} 个姿态。")
+
+    # 步骤 4: 执行立体标定
+    # =========================================================================
+    print_func("\n步骤 4: 执行立体标定以计算投影仪参数...")
+    
+    if global_optimization:
+        print_func("使用全局优化方法 (Levenberg-Marquardt)...")
+        reprojection_error, calibration_data = calibration.calibrate_projector_with_camera_global(
+            camera_matrix=camera_matrix,
+            camera_distortion=camera_distortion,
+            proj_cam_correspondences=list(zip(all_proj_points, all_cam_points)),
+            board_points=all_obj_points
+        )
+    else:
+        print_func("使用OpenCV标准立体标定方法...")
+        reprojection_error, calibration_data = calibration.calibrate_projector_with_camera(
+            camera_matrix=camera_matrix,
+            camera_distortion=camera_distortion,
+            proj_cam_correspondences=list(zip(all_proj_points, all_cam_points)),
+            board_points=all_obj_points
+        )
+
+    print_func(f"标定完成！最终重投影误差: {reprojection_error:.4f} 像素")
+
+    # 保存标定结果
+    calibration_file_path = os.path.join(output_folder, "projector_calibration.json")
+    calibration.save_calibration(calibration_file_path, include_metadata=True)
+    print_func(f"标定结果已保存至: {calibration_file_path}")
+    
+    print_func("\n标定成功！")
+    print_func("=" * 60)
+    
+    return calibration, calibration_file_path
 
 def show_calibration_tips(board_type):
-    """
-    根据标定板类型显示标定提示
-    """
+    """显示一些有用的标定提示"""
     print("\n标定提示:")
     if board_type == 'chessboard':
         print("请确保棋盘格标定板平整，无明显变形。")

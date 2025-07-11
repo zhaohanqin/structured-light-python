@@ -130,7 +130,7 @@ class CardWidget(QFrame):
 class FileInputWidget(QWidget):
     """文件输入选择小部件，带有浏览按钮"""
     
-    def __init__(self, label_text, file_filter="All Files (*.*)", parent=None):
+    def __init__(self, label_text, file_filter="All Files (*.*)", tooltip_text="", parent=None):
         super().__init__(parent)
         self.file_filter = file_filter
         
@@ -162,6 +162,12 @@ class FileInputWidget(QWidget):
         self.browse_btn = StyledPushButton("浏览")
         self.browse_btn.clicked.connect(self.browse_file)
         
+        # 设置提示
+        if tooltip_text:
+            self.file_path.setToolTip(tooltip_text)
+            self.browse_btn.setToolTip(tooltip_text)
+            self.label.setToolTip(tooltip_text)
+
         layout.addWidget(self.label)
         layout.addWidget(self.file_path, 1)
         layout.addWidget(self.browse_btn)
@@ -217,6 +223,12 @@ class OutputDirWidget(QWidget):
         self.browse_btn = StyledPushButton("浏览")
         self.browse_btn.clicked.connect(self.browse_dir)
         
+        # 设置提示
+        tooltip = "选择一个文件夹用于保存最终的点云、网格模型和其他结果文件。"
+        self.label.setToolTip(tooltip)
+        self.dir_path.setToolTip(tooltip)
+        self.browse_btn.setToolTip(tooltip)
+
         layout.addWidget(self.label)
         layout.addWidget(self.dir_path, 1)
         layout.addWidget(self.browse_btn)
@@ -329,19 +341,24 @@ class StructuredLightUI(QMainWindow):
         
         # 文件输入
         self.camera_params_input = FileInputWidget(
-            "相机参数:", "参数文件 (*.npy *.json)"
+            "相机参数:", "参数文件 (*.npy *.json)",
+            "选择包含相机内参矩阵和畸变系数的标定文件。"
         )
         self.projector_params_input = FileInputWidget(
-            "投影仪参数:", "参数文件 (*.json *.npy)"
+            "投影仪参数:", "参数文件 (*.json *.npy)",
+            "选择包含投影仪内参矩阵、宽度和高度的标定文件。"
         )
         self.extrinsics_input = FileInputWidget(
-            "外参:", "参数文件 (*.npy *.json)"
+            "外参:", "参数文件 (*.npy *.json)",
+            "选择包含相机和投影仪之间旋转(R)和平移(T)关系的外参文件。"
         )
         self.phase_x_input = FileInputWidget(
-            "X方向相位:", "相位文件 (*.npy *.png *.jpg *.jpeg *.bmp *.tiff *.tif)"
+            "X方向相位:", "相位文件 (*.npy *.png *.jpg *.jpeg *.bmp *.tiff *.tif)",
+            "选择由相位解包裹程序生成的X方向（水平）解包裹相位图。"
         )
         self.phase_y_input = FileInputWidget(
-            "Y方向相位:", "相位文件 (*.npy *.png *.jpg *.jpeg *.bmp *.tiff *.tif)"
+            "Y方向相位:", "相位文件 (*.npy *.png *.jpg *.jpeg *.bmp *.tiff *.tif)",
+            "选择由相位解包裹程序生成的Y方向（垂直）解包裹相位图。"
         )
         self.output_dir_input = OutputDirWidget()
         
@@ -354,6 +371,10 @@ class StructuredLightUI(QMainWindow):
         mask_label.setMinimumWidth(150)
         mask_label.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-weight: bold;")
         self.mask_percentile = QDoubleSpinBox()
+        self.mask_percentile.setToolTip(
+            "用于生成有效区域掩码的相位梯度阈值。\n"
+            "值越高，保留的区域越多，可能包含噪声；值越低，结果越干净，但可能丢失细节。"
+        )
         self.mask_percentile.setRange(1.0, 99.9)  # 设置范围
         self.mask_percentile.setValue(98.0)  # 默认值
         self.mask_percentile.setDecimals(1)  # 小数点位数
@@ -375,6 +396,7 @@ class StructuredLightUI(QMainWindow):
         # 创建网格选项
         self.create_mesh = QCheckBox("从点云创建网格")
         self.create_mesh.setChecked(True)  # 默认选中
+        self.create_mesh.setToolTip("如果选中，程序将在生成点云后，自动进行网格化处理，生成一个连续的3D表面模型。")
         self.create_mesh.setStyleSheet(f"""
             QCheckBox {{
                 color: {COLOR_TEXT_PRIMARY};
@@ -406,6 +428,7 @@ class StructuredLightUI(QMainWindow):
         
         # 重建按钮
         self.reconstruct_btn = StyledPushButton("重建3D场景")
+        self.reconstruct_btn.setToolTip("加载所有参数并开始完整的三维重建流程。")
         self.reconstruct_btn.setMinimumHeight(50)
         self.reconstruct_btn.clicked.connect(self.start_reconstruction)
         

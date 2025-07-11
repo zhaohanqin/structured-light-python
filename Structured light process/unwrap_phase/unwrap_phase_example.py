@@ -251,22 +251,22 @@ def main():
     unwrapped_results = {}
     
     print("\n处理水平方向相移图像...")
-    horizontal_unwrapped = unwrap_phase.process_four_step_images(
+    horizontal_result = unwrap_phase.process_single_frequency_images(
         image_paths=image_paths["horizontal"],
         output_dir=os.path.join(output_dir, "horizontal"),
         method="quality_guided",
         show_plots=True  # 显示图形
     )
-    unwrapped_results["horizontal"] = horizontal_unwrapped
+    unwrapped_results["horizontal"] = horizontal_result['unwrapped_phase'] if horizontal_result else None
     
     print("\n处理垂直方向相移图像...")
-    vertical_unwrapped = unwrap_phase.process_four_step_images(
+    vertical_result = unwrap_phase.process_single_frequency_images(
         image_paths=image_paths["vertical"],
         output_dir=os.path.join(output_dir, "vertical"),
         method="quality_guided",
         show_plots=True  # 显示图形
     )
-    unwrapped_results["vertical"] = vertical_unwrapped
+    unwrapped_results["vertical"] = vertical_result['unwrapped_phase'] if vertical_result else None
     
     # 可视化3D结果
     print("\n生成3D可视化结果...")

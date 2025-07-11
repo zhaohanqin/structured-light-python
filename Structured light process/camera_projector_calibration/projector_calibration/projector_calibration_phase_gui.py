@@ -81,11 +81,17 @@ class CalibrationThread(QThread):
     def run(self):
         try:
             # 重定向标准输出到我们的信号
-            original_print = print
+            # 保存原始print函数，以防重入
+            if not hasattr(cal, 'original_print'):
+                cal.original_print = print
+            
             def custom_print(*args, **kwargs):
                 message = " ".join(map(str, args))
                 self.status_update.emit(message)
-                original_print(*args, **kwargs)
+                # 不再调用原始print，避免在GUI日志和控制台重复输出
+                # original_print(*args, **kwargs)
+            
+            # 将cal模块的print重定向到我们的信号发射函数
             cal.print = custom_print
             
             # 发送开始信息
@@ -94,7 +100,9 @@ class CalibrationThread(QThread):
             
             # 加载相机参数
             camera_params_file = self.params.get("camera_params_file")
-            self.status_update.emit(f"加载相机标定参数: {camera_params_file}")
+            if camera_params_file:
+                 self.status_update.emit(f"加载相机标定参数: {os.path.basename(camera_params_file)}")
+            
             self.progress_update.emit(20)
             
             # 执行标定
@@ -107,10 +115,12 @@ class CalibrationThread(QThread):
                 chessboard_size=(self.params.get("chessboard_width"), self.params.get("chessboard_height")),
                 square_size=self.params.get("square_size"),
                 output_folder=self.params.get("output_folder"),
-                visualize=False,  # 我们在GUI中自己处理可视化
+                visualize=self.params.get("visualize", False), # 添加默认值
                 global_optimization=self.params.get("global_optimization"),
                 sampling_step=self.params.get("sampling_step"),
-                adaptive_threshold=self.params.get("adaptive_threshold")
+                adaptive_threshold=self.params.get("adaptive_threshold"),
+                n_steps=self.params.get("n_steps"),
+                print_func=custom_print # 传递自定义打印函数
             )
             
             # 发送完成信息
@@ -153,7 +163,9 @@ class CalibrationThread(QThread):
             traceback.print_exc()
         finally:
             # 恢复原始print函数
-            cal.print = original_print
+            if hasattr(cal, 'original_print'):
+                cal.print = cal.original_print
+            self.status_update.emit("标定线程结束。")
 
 class ImageViewer(QWidget):
     """图像查看器小部件"""
@@ -451,6 +463,7 @@ class ProjectorCalibrationGUI(QMainWindow):
         # 相机参数文件
         self.camera_params_edit = QLineEdit()
         self.camera_params_edit.setPlaceholderText("选择相机标定参数文件...")
+        self.camera_params_edit.setToolTip("选择之前由相机标定程序生成的相机内参和畸变系数文件 (.json, .npy)。")
         self.camera_params_btn = QPushButton("浏览...")
         camera_params_layout = QHBoxLayout()
         camera_params_layout.addWidget(self.camera_params_edit, 3)
@@ -459,7 +472,12 @@ class ProjectorCalibrationGUI(QMainWindow):
         
         # 相位图像文件夹
         self.phase_images_edit = QLineEdit()
-        self.phase_images_edit.setPlaceholderText("选择包含相移图案图像的文件夹...")
+        self.phase_images_edit.setPlaceholderText("选择包含多个姿态子文件夹的主文件夹...")
+        self.phase_images_edit.setToolTip(
+            "请选择一个主文件夹，该文件夹内包含多个子文件夹，每个子文件夹代表一个标定姿态。\n"
+            "每个子文件夹内应有 2*N 张图像 (N为相移步数)。\n"
+            "例如，对于N=4步相移，需要I1-I4 (水平)和I5-I8 (垂直)。"
+        )
         self.phase_images_btn = QPushButton("浏览...")
         phase_images_layout = QHBoxLayout()
         phase_images_layout.addWidget(self.phase_images_edit, 3)
@@ -469,6 +487,7 @@ class ProjectorCalibrationGUI(QMainWindow):
         # 输出文件夹
         self.output_folder_edit = QLineEdit()
         self.output_folder_edit.setPlaceholderText("选择输出结果文件夹...")
+        self.output_folder_edit.setToolTip("选择一个文件夹用于保存标定日志、中间相位图和最终的标定结果文件。")
         self.output_folder_btn = QPushButton("浏览...")
         output_folder_layout = QHBoxLayout()
         output_folder_layout.addWidget(self.output_folder_edit, 3)
@@ -480,9 +499,11 @@ class ProjectorCalibrationGUI(QMainWindow):
         self.proj_width_spin = QSpinBox()
         self.proj_width_spin.setRange(100, 10000)
         self.proj_width_spin.setValue(1280)
+        self.proj_width_spin.setToolTip("输入投影仪的水平分辨率（宽度），单位为像素。")
         self.proj_height_spin = QSpinBox()
         self.proj_height_spin.setRange(100, 10000)
         self.proj_height_spin.setValue(720)
+        self.proj_height_spin.setToolTip("输入投影仪的垂直分辨率（高度），单位为像素。")
         res_layout.addWidget(QLabel("宽:"))
         res_layout.addWidget(self.proj_width_spin)
         res_layout.addWidget(QLabel("高:"))
@@ -501,6 +522,7 @@ class ProjectorCalibrationGUI(QMainWindow):
         # 标定板类型
         self.board_type_combo = QComboBox()
         self.board_type_combo.addItems(["棋盘格标定板", "圆形标定板", "环形标定板"])
+        self.board_type_combo.setToolTip("根据您使用的物理标定板选择其类型。")
         layout.addRow("标定板类型:", self.board_type_combo)
         
         # 标定板尺寸
@@ -508,9 +530,11 @@ class ProjectorCalibrationGUI(QMainWindow):
         self.board_width_spin = QSpinBox()
         self.board_width_spin.setRange(2, 30)
         self.board_width_spin.setValue(9)
+        self.board_width_spin.setToolTip("输入标定板内部角点的数量（宽度方向）。")
         self.board_height_spin = QSpinBox()
         self.board_height_spin.setRange(2, 30)
         self.board_height_spin.setValue(6)
+        self.board_height_spin.setToolTip("输入标定板内部角点的数量（高度方向）。")
         board_size_layout.addWidget(QLabel("宽:"))
         board_size_layout.addWidget(self.board_width_spin)
         board_size_layout.addWidget(QLabel("高:"))
@@ -522,6 +546,7 @@ class ProjectorCalibrationGUI(QMainWindow):
         self.square_size_spin.setRange(1.0, 1000.0)
         self.square_size_spin.setValue(20.0)
         self.square_size_spin.setSuffix(" mm")
+        self.square_size_spin.setToolTip("输入标定板上一个方格的边长，或圆心之间的距离，单位为毫米(mm)。")
         layout.addRow("方格尺寸或圆心间距:", self.square_size_spin)
         
         group.setLayout(layout)
@@ -536,22 +561,33 @@ class ProjectorCalibrationGUI(QMainWindow):
         # 全局优化
         self.global_opt_check = QCheckBox("使用全局优化方法提高精度")
         self.global_opt_check.setChecked(True)
+        self.global_opt_check.setToolTip("推荐勾选。该方法会联合优化相机和投影仪的参数，通常可以获得更精确的结果。")
         layout.addRow("", self.global_opt_check)
         
-        # 采样步长
+        # 相位图采样步长
         self.sampling_step_spin = QSpinBox()
         self.sampling_step_spin.setRange(1, 50)
         self.sampling_step_spin.setValue(4)
+        self.sampling_step_spin.setToolTip("在从相位图中提取对应点时，每隔N个像素采一个点。值越小，点越多，计算越慢。")
         layout.addRow("相位图采样步长:", self.sampling_step_spin)
         
+        # 相移步数
+        self.n_steps_spin = QSpinBox()
+        self.n_steps_spin.setRange(3, 16) # 3步到16步
+        self.n_steps_spin.setValue(4)
+        self.n_steps_spin.setToolTip("设置相移的步数(N)。\n每个姿态子文件夹内需要包含 2*N 张图像。")
+        layout.addRow("相移步数 (N):", self.n_steps_spin)
+
         # 自适应阈值
         self.adaptive_threshold_check = QCheckBox("使用自适应质量阈值")
         self.adaptive_threshold_check.setChecked(True)
+        self.adaptive_threshold_check.setToolTip("自动根据当前图像的质量来确定一个阈值，以过滤掉低质量的相位点。")
         layout.addRow("", self.adaptive_threshold_check)
         
         # 可视化结果
         self.visualize_check = QCheckBox("显示过程可视化图像")
         self.visualize_check.setChecked(False)
+        self.visualize_check.setToolTip("勾选后，在标定过程中会弹出显示中间结果的图像窗口，可用于调试。")
         layout.addRow("", self.visualize_check)
         
         group.setLayout(layout)
@@ -639,7 +675,7 @@ class ProjectorCalibrationGUI(QMainWindow):
     def select_phase_images(self):
         """选择相位图像文件夹"""
         folder_path = QFileDialog.getExistingDirectory(
-            self, "选择包含相移图案图像的文件夹"
+            self, "选择主图像文件夹 (其内部应包含多个姿态子文件夹)"
         )
         if folder_path:
             self.phase_images_edit.setText(folder_path)
@@ -704,7 +740,8 @@ class ProjectorCalibrationGUI(QMainWindow):
             "square_size": self.square_size_spin.value(),
             "global_optimization": self.global_opt_check.isChecked(),
             "sampling_step": self.sampling_step_spin.value(),
-            "adaptive_threshold": self.adaptive_threshold_check.isChecked()
+            "adaptive_threshold": self.adaptive_threshold_check.isChecked(),
+            "n_steps": self.n_steps_spin.value()
         }
         
         return params
@@ -731,7 +768,7 @@ class ProjectorCalibrationGUI(QMainWindow):
         # 创建并启动标定线程
         self.calibration_thread = CalibrationThread(params)
         self.calibration_thread.progress_update.connect(self.update_progress)
-        self.calibration_thread.status_update.connect(self.update_status)
+        self.calibration_thread.status_update.connect(self.update_status_and_log)
         self.calibration_thread.calibration_complete.connect(self.handle_calibration_complete)
         self.calibration_thread.calibration_error.connect(self.handle_calibration_error)
         self.calibration_thread.image_update.connect(self.handle_image_update)
@@ -773,8 +810,13 @@ class ProjectorCalibrationGUI(QMainWindow):
     @Slot(str)
     def update_status(self, message):
         """更新状态消息"""
-        # 日志框会自动更新，因为我们已经重定向了标准输出
+        # 我们使用一个新函数同时更新日志和状态
         pass
+
+    @Slot(str)
+    def update_status_and_log(self, message):
+        """更新日志和状态消息"""
+        self.log_text.append(message)
     
     @Slot(dict)
     def handle_calibration_complete(self, result):
