@@ -1,7 +1,6 @@
 import numpy as np
 import cv2
 import matplotlib
-# 设置Matplotlib不使用GUI后端，避免线程问题
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm

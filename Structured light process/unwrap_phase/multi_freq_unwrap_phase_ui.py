@@ -15,7 +15,6 @@ import cv2
 from typing import List, Optional, Tuple, Dict
 from enum import Enum
 import matplotlib
-# 设置Matplotlib不使用GUI后端，避免线程问题
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import glob # Added for folder scanning
