@@ -203,10 +203,6 @@ def multi_frequency_unwrap(
     base_unwrapped_phase = levels[-1]['phases'][0].copy()
     print(f"  使用频率为 {levels[-1]['freqs'][0]} Hz 的等效相位作为展开基准。")
 
-    # 增强基准相位的稳定性
-    # 对基准相位应用中值滤波，去除噪声
-    base_unwrapped_phase = medfilt2d(base_unwrapped_phase, kernel_size=5)
-    
     # 自动检测相位方向
     # 为提高方向判断的稳定性，我们对基准相位进行一次强力滤波，并仅将该滤波结果用于方向判断
     base_phase_for_orient = medfilt2d(base_unwrapped_phase, kernel_size=15)
@@ -236,6 +232,46 @@ def multi_frequency_unwrap(
     
     # 初始化k_map字典，用于存储每个频率的条纹阶数
     k_maps = {}
+    
+    # 【新改进】对基准相位执行更强的平滑和非负化处理
+    # 首先确保无负值
+    unwrapped_phase = np.maximum(unwrapped_phase, 0)
+    
+    # 应用更强的平滑，确保低频相位足够平滑
+    unwrapped_phase = medfilt2d(unwrapped_phase, kernel_size=11)
+    
+    # 【新改进】对基准相位的梯度方向进行更稳健的处理
+    # 计算梯度
+    gy, gx = np.gradient(unwrapped_phase)
+    
+    # 根据预期方向，确保梯度主体是正向的
+    if direction == 'horizontal':
+        # 水平方向，应该主要是x方向的正梯度
+        if np.median(gx) < 0:
+            print("  基准相位梯度方向不符合预期，进行翻转。")
+            unwrapped_phase = -unwrapped_phase + np.max(-unwrapped_phase)  # 翻转并保持非负
+    else:  # vertical
+        # 垂直方向，应该主要是y方向的正梯度
+        if np.median(gy) < 0:
+            print("  基准相位梯度方向不符合预期，进行翻转。")
+            unwrapped_phase = -unwrapped_phase + np.max(-unwrapped_phase)  # 翻转并保持非负
+    
+    # 【新改进】对基准相位进行零点对齐
+    # 对于水平方向，使左侧为起始点；对于垂直方向，使顶部为起始点
+    if direction == 'horizontal':
+        # 水平方向，使用左侧10%区域的最小值作为零点
+        left_region = unwrapped_phase[:, :int(width * 0.1)]
+        zero_ref = np.percentile(left_region, 5)  # 使用低百分位数，避免异常值影响
+    else:
+        # 垂直方向，使用顶部10%区域的最小值作为零点
+        top_region = unwrapped_phase[:int(height * 0.1), :]
+        zero_ref = np.percentile(top_region, 5)  # 使用低百分位数，避免异常值影响
+    
+    # 对齐零点，确保基准相位从接近0开始
+    unwrapped_phase -= zero_ref
+    unwrapped_phase = np.maximum(unwrapped_phase, 0)  # 再次确保非负
+    
+    print(f"  基准相位已优化：进行了平滑处理、方向校正和零点对齐 (零点参考值: {zero_ref:.2f})。")
     
     # 逐级展开，使用更稳健的策略
     for i in range(len(levels) - 2, -1, -1):
@@ -271,24 +307,58 @@ def multi_frequency_unwrap(
         # 为了更稳健，我们选择质量高且置信度高的区域作为种子
         combined_quality = confidence * quality_map
         
-        # 找出质量最高的前10%点，然后从中选择一个作为种子
-        threshold = np.percentile(combined_quality, 90)
-        high_quality_mask = combined_quality > threshold
-        
-        # 如果没有高质量点，则使用全局最高质量点
-        if not np.any(high_quality_mask):
-            seed_y, seed_x = np.unravel_index(np.argmax(combined_quality), combined_quality.shape)
-        else:
-            # 从高质量区域中选择一个中心点作为种子
-            y_indices, x_indices = np.where(high_quality_mask)
-            center_y, center_x = height // 2, width // 2
+        # 【改进】不再使用随机种子点或纯粹基于质量的种子点
+        # 而是根据解包裹方向，选择起始边缘中心附近的高质量点作为种子
+        if direction == 'horizontal':
+            # 水平方向，从左侧边缘开始解包裹
+            # 在左侧5%区域内寻找高质量点
+            left_edge = int(width * 0.05)
+            edge_region_quality = combined_quality[:, :left_edge]
             
-            # 计算每个高质量点到图像中心的距离
-            distances = np.sqrt((y_indices - center_y)**2 + (x_indices - center_x)**2)
+            # 找出质量较高的点（超过中值的点）
+            threshold = np.median(edge_region_quality)
+            high_quality_mask = edge_region_quality > threshold
             
-            # 选择距离中心最近的高质量点作为种子
-            closest_idx = np.argmin(distances)
-            seed_y, seed_x = y_indices[closest_idx], x_indices[closest_idx]
+            if np.any(high_quality_mask):
+                # 在高质量点中找一个接近中心的点作为种子
+                y_indices, x_indices = np.where(high_quality_mask)
+                center_y = height // 2
+                
+                # 找出离中心y最近的点
+                closest_idx = np.argmin(np.abs(y_indices - center_y))
+                seed_y = y_indices[closest_idx]
+                seed_x = x_indices[closest_idx]
+                print(f"  选择左侧边缘的高质量种子点: ({seed_x}, {seed_y})")
+            else:
+                # 如果没有高质量点，选择左侧边缘中心点
+                seed_y = height // 2
+                seed_x = left_edge // 2
+                print(f"  使用左侧边缘中心点作为种子: ({seed_x}, {seed_y})")
+        else:  # vertical
+            # 垂直方向，从上侧边缘开始解包裹
+            # 在上侧5%区域内寻找高质量点
+            top_edge = int(height * 0.05)
+            edge_region_quality = combined_quality[:top_edge, :]
+            
+            # 找出质量较高的点（超过中值的点）
+            threshold = np.median(edge_region_quality)
+            high_quality_mask = edge_region_quality > threshold
+            
+            if np.any(high_quality_mask):
+                # 在高质量点中找一个接近中心的点作为种子
+                y_indices, x_indices = np.where(high_quality_mask)
+                center_x = width // 2
+                
+                # 找出离中心x最近的点
+                closest_idx = np.argmin(np.abs(x_indices - center_x))
+                seed_y = y_indices[closest_idx]
+                seed_x = x_indices[closest_idx]
+                print(f"  选择上侧边缘的高质量种子点: ({seed_x}, {seed_y})")
+            else:
+                # 如果没有高质量点，选择上侧边缘中心点
+                seed_y = top_edge // 2
+                seed_x = width // 2
+                print(f"  使用上侧边缘中心点作为种子: ({seed_x}, {seed_y})")
         
         # 【改进13】初始化已访问掩码
         visited = np.zeros_like(k, dtype=bool)
@@ -516,6 +586,37 @@ def multi_frequency_unwrap(
     # 确保没有负值
     unwrapped_phase[unwrapped_phase < 0] = 0
 
+    # 【新增改进29】应用额外平滑以确保结果更加平滑
+    # 使用更小的滤波核进行最终平滑，保留边缘细节
+    if filter_kernel_size > 1:
+        smoothed_phase = medfilt2d(unwrapped_phase, kernel_size=3)
+        # 不直接替换，而是加权混合，保留细节
+        unwrapped_phase = 0.8 * smoothed_phase + 0.2 * unwrapped_phase
+    
+    # 【新增改进30】再次检查并确保没有负值
+    unwrapped_phase = np.maximum(unwrapped_phase, 0)
+    
+    # 【新增改进31】检查并修复局部不连续区域
+    # 计算局部梯度的方差
+    gy, gx = np.gradient(unwrapped_phase)
+    grad_mag = np.sqrt(gy**2 + gx**2)
+    local_var = cv2.boxFilter(grad_mag, -1, (5, 5), normalize=True)
+    
+    # 找出局部梯度方差异常大的区域
+    high_var_mask = local_var > np.mean(local_var) + 3 * np.std(local_var)
+    if np.any(high_var_mask):
+        print(f"  检测到 {np.sum(high_var_mask)} 个局部不连续点，进行修复...")
+        # 对这些区域进行局部中值滤波
+        for _ in range(3):  # 迭代几次以确保平滑
+            # 创建一个临时数组以避免边界效应
+            temp = unwrapped_phase.copy()
+            # 在高方差区域应用局部中值滤波
+            for i in range(2, height-2):
+                for j in range(2, width-2):
+                    if high_var_mask[i, j]:
+                        temp[i, j] = np.median(unwrapped_phase[i-2:i+3, j-2:j+3])
+            unwrapped_phase = temp
+
     print("\n--- 多频外差解包裹完成 ---")
     return unwrapped_phase, k_map
 
@@ -586,21 +687,42 @@ def _auto_orient_phase(unwrapped_phase: np.ndarray, direction: str) -> Tuple[np.
     gy, gx = np.gradient(unwrapped_phase)
 
     was_flipped = False
-    # 根据方向检查梯度的中值
+    # 【新改进】使用更稳健的方法判断相位方向
     if direction == 'horizontal':
         # 水平方向，相位应从左到右增加，即x梯度为正
+        # 使用中值而不是均值，对异常值更稳健
         median_gradient = np.median(gx)
-        if median_gradient < 0:
+        
+        # 【新改进】计算正梯度和负梯度的比例
+        positive_ratio = np.sum(gx > 0) / gx.size
+        negative_ratio = np.sum(gx < 0) / gx.size
+        
+        # 如果中值为负或者负梯度明显多于正梯度，则认为方向相反
+        if median_gradient < 0 or (negative_ratio > 0.6 and positive_ratio < 0.4):
             print("自动方向修正：检测到水平相位方向相反，已进行翻转。")
+            print(f"  梯度中值: {median_gradient:.4f}, 正梯度比例: {positive_ratio:.2f}, 负梯度比例: {negative_ratio:.2f}")
             was_flipped = True
             return -unwrapped_phase, was_flipped
     elif direction == 'vertical':
         # 垂直方向，相位应从上到下增加，即y梯度为正
         median_gradient = np.median(gy)
-        if median_gradient < 0:
+        
+        # 【新改进】计算正梯度和负梯度的比例
+        positive_ratio = np.sum(gy > 0) / gy.size
+        negative_ratio = np.sum(gy < 0) / gy.size
+        
+        # 如果中值为负或者负梯度明显多于正梯度，则认为方向相反
+        if median_gradient < 0 or (negative_ratio > 0.6 and positive_ratio < 0.4):
             print("自动方向修正：检测到垂直相位方向相反，已进行翻转。")
+            print(f"  梯度中值: {median_gradient:.4f}, 正梯度比例: {positive_ratio:.2f}, 负梯度比例: {negative_ratio:.2f}")
             was_flipped = True
             return -unwrapped_phase, was_flipped
+    
+    # 【新改进】记录方向判断的依据，便于调试
+    if direction == 'horizontal':
+        print(f"相位方向判断：水平方向梯度中值为 {np.median(gx):.4f}，保持原方向。")
+    else:
+        print(f"相位方向判断：垂直方向梯度中值为 {np.median(gy):.4f}，保持原方向。")
     
     return unwrapped_phase, was_flipped
 
@@ -826,6 +948,71 @@ def process_multi_frequency_images(
 
     # 2. 确保没有负值（由于噪声可能产生极小的负数）
     unwrapped_phase[unwrapped_phase < 0] = 0
+    
+    # 【新增全局改进A】添加一个可选的全局平滑操作
+    # 这里使用高斯滤波而非中值滤波，以保留更多细节
+    smoothed_phase = cv2.GaussianBlur(unwrapped_phase, (5, 5), 0.5)
+    # 以80%原始相位与20%平滑相位混合，保留细节的同时增强平滑性
+    unwrapped_phase = 0.8 * unwrapped_phase + 0.2 * smoothed_phase
+    
+    # 【新增全局改进B】使用梯度信息检查并修复全局平滑性
+    gy, gx = np.gradient(unwrapped_phase)
+    if direction == 'horizontal':
+        # 对于水平方向，主要关注x方向的梯度
+        gradient_mag = np.abs(gx)
+    else:
+        # 对于垂直方向，主要关注y方向的梯度
+        gradient_mag = np.abs(gy)
+    
+    # 检测异常大的梯度（可能是跳变点）
+    median_grad = np.median(gradient_mag)
+    std_grad = np.std(gradient_mag)
+    outliers = gradient_mag > median_grad + 5 * std_grad
+    
+    if np.any(outliers):
+        print(f"全局处理：检测到 {np.sum(outliers)} 个梯度异常点，进行平滑修复...")
+        # 对异常点应用局部中值滤波
+        outliers_dilated = binary_dilation(outliers, iterations=2)  # 稍微扩大区域以确保覆盖问题区域
+        for i in range(2, unwrapped_phase.shape[0]-2):
+            for j in range(2, unwrapped_phase.shape[1]-2):
+                if outliers_dilated[i, j]:
+                    unwrapped_phase[i, j] = np.median(unwrapped_phase[i-2:i+3, j-2:j+3])
+    
+    # 【新增全局改进C】最终确保没有负值和极值点
+    unwrapped_phase = np.maximum(unwrapped_phase, 0)
+    
+    # 检测并处理孤立的极值点
+    local_max = unwrapped_phase > np.roll(unwrapped_phase, 1, axis=0)
+    local_max &= unwrapped_phase > np.roll(unwrapped_phase, -1, axis=0)
+    local_max &= unwrapped_phase > np.roll(unwrapped_phase, 1, axis=1)
+    local_max &= unwrapped_phase > np.roll(unwrapped_phase, -1, axis=1)
+    local_min = unwrapped_phase < np.roll(unwrapped_phase, 1, axis=0)
+    local_min &= unwrapped_phase < np.roll(unwrapped_phase, -1, axis=0)
+    local_min &= unwrapped_phase < np.roll(unwrapped_phase, 1, axis=1)
+    local_min &= unwrapped_phase < np.roll(unwrapped_phase, -1, axis=1)
+    
+    # 找出明显偏离周围平均值的极值点
+    extrema = np.zeros_like(unwrapped_phase, dtype=bool)
+    for i in range(2, unwrapped_phase.shape[0]-2):
+        for j in range(2, unwrapped_phase.shape[1]-2):
+            if local_max[i, j] or local_min[i, j]:
+                neighborhood = unwrapped_phase[i-2:i+3, j-2:j+3]
+                neighborhood_mean = np.mean(neighborhood)
+                neighborhood_std = np.std(neighborhood)
+                if abs(unwrapped_phase[i, j] - neighborhood_mean) > 3 * neighborhood_std:
+                    extrema[i, j] = True
+    
+    # 修复极值点
+    if np.any(extrema):
+        print(f"全局处理：检测到 {np.sum(extrema)} 个异常极值点，进行修复...")
+        for i in range(2, unwrapped_phase.shape[0]-2):
+            for j in range(2, unwrapped_phase.shape[1]-2):
+                if extrema[i, j]:
+                    neighborhood = unwrapped_phase[i-2:i+3, j-2:j+3]
+                    # 排除当前点本身
+                    neighborhood_flat = neighborhood.flatten()
+                    neighborhood_flat = neighborhood_flat[neighborhood_flat != unwrapped_phase[i, j]]
+                    unwrapped_phase[i, j] = np.median(neighborhood_flat)
 
     # 3. 基于最终的、边缘对齐的非负相位，重新计算k值，确保一致性
     if k_map is not None:
