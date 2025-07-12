@@ -31,12 +31,14 @@
 ## 多线程支持改进
 
 1. **设置Matplotlib后端**：
+
    ```python
    matplotlib.use('Agg')  # 设置不使用GUI后端
    ```
 
 2. **可控的绘图显示**：
    所有可视化函数都包含 `show_plots: bool = True` 参数。当在线程中调用时，应将其设置为 `False`，此时图像将直接保存到文件而不尝试在屏幕上显示。
+
    ```python
    def visualize_wrapped_phase(..., show_plots: bool = True):
        # ...
