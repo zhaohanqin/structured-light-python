@@ -613,13 +613,11 @@ class PhaseUnwrapperUI(QMainWindow):
         method_layout.addWidget(QLabel("掩膜生成方法:"))
         self.mask_combo = QComboBox()
         self.mask_combo.addItem("Otsu 自适应阈值", "otsu")
-        self.mask_combo.addItem("自适应阈值 (Gaussian)", "adaptive")
         self.mask_combo.addItem("相对百分位阈值", "relative")
         self.mask_combo.setCurrentIndex(0)
         self.mask_combo.currentIndexChanged.connect(self.update_mask_method)
         self.mask_combo.setToolTip("选择用于生成投影区域掩膜的方法：\n"
                                    "• Otsu 自适应阈值: 通常效果最好\n"
-                                   "• 自适应阈值(Gaussian): 光照不均时更稳健\n"
                                    "• 相对百分位阈值: 以比例控制掩膜大小")
         method_layout.addWidget(self.mask_combo)
         

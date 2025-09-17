@@ -187,17 +187,18 @@ def compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShif
 
 def generate_projection_mask(images: List[np.ndarray], 
                            algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
-                           method: str = 'otsu', 
+                          method: str = 'otsu', 
                            thresh_rel: Optional[float] = None, 
                            min_area: int = 500,
-                           confidence: float = 0.5) -> np.ndarray:
+                           confidence: float = 0.5,
+                           border_trim_px: int = 10) -> np.ndarray:
     """
     基于相移图像生成投影区域掩膜，用于区分投影区域和背景
     
     参数:
         images: 相移图像列表
         algorithm: 相移算法类型
-        method: 阈值化方法 ('otsu', 'adaptive', 'relative')
+        method: 阈值化方法 ('otsu', 'relative')
         thresh_rel: 相对阈值（仅用于relative方法）
         min_area: 最小连通区域面积
         confidence: 掩膜置信度阈值 (0.1-0.9)，控制掩膜的严格程度
@@ -205,42 +206,66 @@ def generate_projection_mask(images: List[np.ndarray],
     返回:
         mask: 二值掩膜，True表示投影区域
     """
-    # 计算振幅图
-    amplitude = compute_amplitude_from_images(images, algorithm)
-    
-    # 归一化振幅到0-255范围
-    a_norm = (amplitude - amplitude.min()) / (amplitude.max() - amplitude.min() + 1e-9)
-    a8 = (a_norm * 255).astype(np.uint8)
+    # 与 test.py 对齐：
+    # 计算四步（或N步）图像的 I_max, I_min, I_mean
+    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
+    I_max = np.max(imgs, axis=2)
+    I_min = np.min(imgs, axis=2)
+    I_mean = np.mean(imgs, axis=2)
+
+    # 振幅 A, 调制度 M, 平均亮度 I_mean
+    A = (I_max - I_min) / 2.0
+    M = (I_max - I_min) / (I_max + I_min + 1e-9)
+
+    # 归一化到0-255范围
+    A_norm = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    M_norm = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    I_norm = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
     # 根据选择的方法进行阈值化，并应用置信度调节
     if method == 'otsu':
-        th = filters.threshold_otsu(a8)
-        # 使用置信度调节阈值：低置信度使阈值更宽松，高置信度使阈值更严格
-        th_adjusted = th * (2 - confidence)  # confidence=0.5时保持原阈值
-        mask = a8 >= th_adjusted
-    elif method == 'adaptive':
-        # 对于自适应阈值，调整偏移参数
-        offset = int(-10 * confidence)  # confidence=0.5时offset=-5
-        mask = cv2.adaptiveThreshold(a8, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 51, offset) > 0
+        # test.py 逻辑：Otsu 分别对 A 和 M，二者取 OR；再与亮度阈值 AND
+        _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 亮度阈值：> 50 分位
+        th_I = np.percentile(I_norm, 50)
+        mask_I = (I_norm > th_I).astype(np.uint8) * 255
+        mask = np.logical_or(mask_A > 0, mask_M > 0)
+        mask = np.logical_and(mask, mask_I > 0)
     elif method == 'relative':
         # 相对百分位阈值：使用置信度调节保留比例
         if thresh_rel is None: 
             thresh_rel = 0.2
         # 置信度越高，保留的像素比例越少（更严格）
         adjusted_thresh_rel = thresh_rel * (2 - confidence)
-        th = np.percentile(a8, 100 * (1 - adjusted_thresh_rel))
-        mask = a8 >= th
+        th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
+        th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
+        th_I = np.percentile(I_norm, 50)
+        mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
+        mask = np.logical_and(mask, I_norm > th_I)
     else:
         raise ValueError(f"不支持的阈值化方法: {method}")
     
     print(f"掩膜生成参数: 方法={method}, 置信度={confidence:.2f}")
     
-    # 形态学清理
+    # 形态学清理（与 test.py 一致）
+    mask = morphology.binary_closing(mask, morphology.disk(7))
     mask = morphology.remove_small_objects(mask, min_size=min_area)
     mask = morphology.remove_small_holes(mask, area_threshold=min_area)
-    mask = morphology.binary_closing(mask, morphology.disk(5))
     mask = mask.astype(np.uint8)
+
+    # 去除图像四周若干像素，避免投影条纹在边界处产生的锯齿伪影
+    if border_trim_px and border_trim_px > 0:
+        h, w = mask.shape
+        bt = min(border_trim_px, min(h // 10, w // 10))
+        if bt > 0:
+            mask[:bt, :] = 0
+            mask[-bt:, :] = 0
+            mask[:, :bt] = 0
+            mask[:, -bt:] = 0
+
+    # 轻微膨胀回收边缘（与 test.py 一致）
+    mask = cv2.dilate(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5)))
     
     # 保留最大连通分量（可选）
     num_labels, labels = cv2.connectedComponents(mask)
@@ -2043,6 +2068,30 @@ def save_unwrapped_phase_raw(unwrapped_phase: np.ndarray, save_path: str, mask: 
     print(f"纯净的解包裹相位图已保存至: {save_path}")
 
 
+def save_wrapped_phase_raw(wrapped_phase: np.ndarray, save_path: str, mask: Optional[np.ndarray] = None):
+    """
+    将包裹相位保存为纯净的彩色图像（无坐标轴）。掩膜外区域设为黑色。
+    """
+    if wrapped_phase is None:
+        print("没有可保存的包裹相位数据")
+        return
+    if mask is None:
+        mask = wrapped_phase != 0
+    height, width = wrapped_phase.shape
+    img_color = np.zeros((height, width, 3), dtype=np.uint8)
+    if np.any(mask):
+        temp = wrapped_phase.copy()
+        temp[~mask] = 0
+        # wrap range is [-pi, pi]; normalize to 0-255
+        temp_min, temp_max = -np.pi, np.pi
+        temp_norm = (np.clip(temp, temp_min, temp_max) - temp_min) / (temp_max - temp_min + 1e-12)
+        gray = (temp_norm * 255).astype(np.uint8)
+        img_color = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+        img_color[~mask] = [0, 0, 0]
+    cv2.imwrite(save_path, img_color)
+    print(f"纯净的包裹相位图已保存至: {save_path}")
+
+
 def generate_combined_phase(h_unwrapped: np.ndarray, v_unwrapped: np.ndarray, 
                            title: str = "水平和垂直方向相位组合图", 
                            save_path: Optional[str] = None, 
@@ -2253,7 +2302,9 @@ def visualize_combined_3d_surface(h_unwrapped: np.ndarray,
 
 def process_single_frequency_images(image_paths: List[str], output_dir: str, method: str, show_plots: bool = True, 
                                   use_mask: bool = True, mask_method: str = 'otsu', min_area: int = 500, 
-                                  mask_confidence: float = 0.5) -> Optional[Dict[str, np.ndarray]]:
+                                  mask_confidence: float = 0.5,
+                                  use_shared_mask: bool = True,
+                                  shared_mask_name: str = 'mask/final_mask.png') -> Optional[Dict[str, np.ndarray]]:
     """
     处理单频条纹图像，执行完整的解包裹流程
     
@@ -2302,49 +2353,67 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
     
     print(f"使用 {num_images}-步 相移算法。")
     
-    # 1. 首先生成投影区域掩膜（如果启用）
+    # 1. 首先生成或复用投影区域掩膜（如果启用）
     mask = None
     if use_mask:
-        print(f"生成投影区域掩膜，方法: {mask_method}")
-        try:
-            mask = generate_projection_mask(images, algorithm=algorithm, method=mask_method, min_area=min_area, confidence=mask_confidence)
-            print(f"掩膜生成完成，投影区域像素数: {np.sum(mask)}")
-            
-            # 保存掩膜图像
-            mask_path = os.path.join(output_dir, "projection_mask.png")
-            cv2.imwrite(mask_path, mask.astype(np.uint8) * 255)
-            print(f"掩膜已保存至: {mask_path}")
-        except Exception as e:
-            print(f"掩膜生成失败: {e}，将不使用掩膜")
-            mask = None
+        # 计算共享掩膜路径：若 output_dir 为 .../horizontal 或 .../vertical，则共享目录为其父目录
+        shared_mask_path = None
+        if use_shared_mask:
+            parent_dir = os.path.abspath(os.path.join(output_dir, os.pardir))
+            shared_mask_path = os.path.join(parent_dir, shared_mask_name)
+            # 准备保存特征图的目录
+            mask_assets_dir = os.path.join(parent_dir, 'mask')
+            os.makedirs(mask_assets_dir, exist_ok=True)
+
+        # 优先复用共享掩膜
+        if use_shared_mask and os.path.isfile(shared_mask_path):
+            print(f"检测到共享掩膜，直接复用: {shared_mask_path}")
+            mask_img = cv2.imdecode(np.fromfile(shared_mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            mask = (mask_img > 0)
+            # 不再在方向文件夹下重复保存掩膜
+        else:
+            print(f"生成投影区域掩膜，方法: {mask_method}")
+            try:
+                mask = generate_projection_mask(images, algorithm=algorithm, method=mask_method, min_area=min_area, confidence=mask_confidence)
+                print(f"掩膜生成完成，投影区域像素数: {np.sum(mask)}")
+                # 同时保存为共享掩膜，供另一方向复用（保存到 mask/final_mask.png）
+                if use_shared_mask and shared_mask_path is not None:
+                    cv2.imwrite(shared_mask_path, mask.astype(np.uint8) * 255)
+                    print(f"共享掩膜已保存至: {shared_mask_path}")
+            except Exception as e:
+                print(f"掩膜生成失败: {e}，将不使用掩膜")
+                mask = None
     else:
         # 如果不使用掩膜，创建一个全True的掩膜
         mask = np.ones((images[0].shape[0], images[0].shape[1]), dtype=bool)
         print("未使用掩膜，将在整个图像区域进行处理")
     
-    # 2. 在掩膜约束下计算包裹相位
+    # 2. 计算包裹相位与质量图（仅用于解包裹；不再在各方向文件夹保存额外可视化图）
     print("在掩膜约束下计算包裹相位...")
     wrapped_phase, _ = compute_phasor_and_phase_masked(images, mask, algorithm=algorithm)
-    
-    # 3. 在掩膜约束下计算相位质量图
+
     print("在掩膜约束下计算相位质量图...")
     quality_map = compute_phase_quality_masked(images, mask)
-    
-    # 2. 保存单独的包裹相位图
-    output_path_wrapped = os.path.join(output_dir, "wrapped_phase.png")
-    visualize_wrapped_phase(wrapped_phase,
-                            quality_map=None, #不显示质量
-                            title="包裹相位图",
-                            save_path=output_path_wrapped,
-                            show_plots=show_plots)
 
-    # 3. 保存包含质量图的包裹相位图
-    output_path_quality = os.path.join(output_dir, "wrapped_phase_and_quality.png")
-    visualize_wrapped_phase(wrapped_phase,
-                            quality_map=quality_map,
-                            title="包裹相位和质量图",
-                            save_path=output_path_quality,
-                            show_plots=show_plots)
+    # 2.1 保存掩膜相关的可视化到共享 mask/ 目录
+    parent_dir = os.path.abspath(os.path.join(output_dir, os.pardir))
+    mask_assets_dir = os.path.join(parent_dir, 'mask')
+    os.makedirs(mask_assets_dir, exist_ok=True)
+    # 重新计算与 test.py 对齐的 A, M, I_mean，并保存
+    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
+    I_max = np.max(imgs, axis=2)
+    I_min = np.min(imgs, axis=2)
+    I_mean = np.mean(imgs, axis=2)
+    A = (I_max - I_min) / 2.0
+    M = (I_max - I_min) / (I_max + I_min + 1e-9)
+    A_img = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    M_img = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    I_img = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cv2.imwrite(os.path.join(mask_assets_dir, 'Amplitude.png'), A_img)
+    cv2.imwrite(os.path.join(mask_assets_dir, 'Modulation.png'), M_img)
+    cv2.imwrite(os.path.join(mask_assets_dir, 'Mean Intensity.png'), I_img)
+    # 最终掩膜副本
+    cv2.imwrite(os.path.join(mask_assets_dir, 'Final Mask.png'), (mask.astype(np.uint8) * 255))
 
     # 解包裹
     print(f"使用解包裹方法: {method}")
@@ -2423,28 +2492,23 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
             # 确保掩膜外区域仍为0
             unwrapped_phase[~mask] = 0
 
-    # 可视化解包裹相位
-    output_path = os.path.join(output_dir, "unwrapped_phase.png")
-    visualize_unwrapped_phase(unwrapped_phase,
-                              title=f"解包裹相位 ({method})",
-                              save_path=output_path,
-                              show_plots=show_plots)
-
-    # 另外保存一幅不带文字和坐标轴的纯净结果图
-    clean_output_path = os.path.join(output_dir, "unwrapped_phase_clean.png")
-    save_unwrapped_phase_raw(unwrapped_phase, clean_output_path, mask)
+    # 保存一幅不带文字和坐标轴的纯净结果图（改名：unwrapped_phase.png）
+    unwrapped_img_path = os.path.join(output_dir, "unwrapped_phase.png")
+    save_unwrapped_phase_raw(unwrapped_phase, unwrapped_img_path, mask)
 
     # 保存解包裹后的npy数据
     npy_output_path = os.path.join(output_dir, "unwrapped_phase.npy")
     np.save(npy_output_path, unwrapped_phase)
     print(f"解包裹相位数据已保存至: {npy_output_path}")
+
+    # 保存包裹相位到当前方向文件夹（PNG + NPY）
+    wrapped_img_path = os.path.join(output_dir, "wrapped_phase.png")
+    save_wrapped_phase_raw(wrapped_phase, wrapped_img_path, mask)
+    wrapped_npy_path = os.path.join(output_dir, "wrapped_phase.npy")
+    np.save(wrapped_npy_path, wrapped_phase)
+    print(f"包裹相位数据已保存至: {wrapped_npy_path}")
     
-    # 可视化3D表面
-    output_3d_path = os.path.join(output_dir, "unwrapped_phase_3d.png")
-    visualize_3d_surface(unwrapped_phase,
-                         title=f"解包裹相位 3D 表面 ({method})",
-                         save_path=output_3d_path,
-                         show_plots=show_plots)
+    # 不再在方向文件夹中生成 wrapped/quality/3D 可视化图
 
     return {
         "unwrapped_phase": unwrapped_phase,
@@ -2464,7 +2528,7 @@ def test_all_unwrap_methods(image_paths: List[str], output_base_dir: str, show_p
     返回:
         results: 包含所有方法结果的字典
     """
-    methods = ["quality_guided", "improved_quality_guided", "robust", "adaptive"]
+    methods = ["quality_guided", "improved_quality_guided", "robust"]
     results = {}
     
     for method in methods:
