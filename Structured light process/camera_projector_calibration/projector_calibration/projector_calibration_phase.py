@@ -141,6 +141,81 @@ def compute_wrapped_phase(images: List[np.ndarray], algorithm: PhaseShiftingAlgo
     return wrapped_phase
 
 
+def _compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step) -> np.ndarray:
+    """
+    从相移图像计算振幅（调制度），用于生成投影区域掩膜
+    """
+    if len(images) < 3:
+        raise ValueError(f"相移图像数量不足。至少需要3张图像，但只提供了{len(images)}张。")
+
+    float_images = [img.astype(np.float32) for img in images]
+    n = len(float_images)
+
+    if algorithm == PhaseShiftingAlgorithm.three_step:
+        I1, I2, I3 = float_images[0], float_images[1], float_images[2]
+        sin_sum = (np.sqrt(3)/2) * (I2 - I3)
+        cos_sum = I1 - 0.5 * (I2 + I3)
+    elif algorithm == PhaseShiftingAlgorithm.four_step:
+        I1, I2, I3, I4 = float_images[0], float_images[1], float_images[2], float_images[3]
+        sin_sum = I2 - I4
+        cos_sum = I1 - I3
+    elif algorithm == PhaseShiftingAlgorithm.n_step:
+        delta = 2 * np.pi / n
+        sin_sum = sum(float_images[i] * np.sin(i * delta) for i in range(n))
+        cos_sum = sum(float_images[i] * np.cos(i * delta) for i in range(n))
+    else:
+        raise ValueError(f"不支持的相移算法: {algorithm}")
+
+    amplitude = np.sqrt(sin_sum**2 + cos_sum**2) * (2 / n)
+    return amplitude
+
+
+def _generate_projection_mask(images: List[np.ndarray], 
+                             algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
+                             method: str = 'otsu', 
+                             thresh_rel: Optional[float] = None, 
+                             min_area: int = 500) -> np.ndarray:
+    """
+    基于相移图像生成投影区域掩膜（True为有效投影区域）
+    """
+    from skimage import morphology
+    import skimage.filters as filters
+
+    amplitude = _compute_amplitude_from_images(images, algorithm)
+    a_norm = (amplitude - amplitude.min()) / (amplitude.max() - amplitude.min() + 1e-9)
+    a8 = (a_norm * 255).astype(np.uint8)
+
+    if method == 'otsu':
+        th = filters.threshold_otsu(a8)
+        mask = a8 >= th
+    elif method == 'adaptive':
+        mask = cv2.adaptiveThreshold(a8, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 51, -5) > 0
+    elif method == 'relative':
+        if thresh_rel is None:
+            thresh_rel = 0.2
+        th = np.percentile(a8, 100 * (1 - thresh_rel))
+        mask = a8 >= th
+    else:
+        raise ValueError(f"不支持的阈值化方法: {method}")
+
+    # 形态学清理
+    mask = morphology.remove_small_objects(mask, min_size=min_area)
+    mask = morphology.remove_small_holes(mask, area_threshold=min_area)
+    mask = morphology.binary_closing(mask, morphology.disk(5))
+    mask = mask.astype(np.uint8)
+
+    # 保留最大连通区域
+    num_labels, labels = cv2.connectedComponents(mask)
+    if num_labels > 1:
+        areas = [(labels == i).sum() for i in range(1, num_labels)]
+        if len(areas) > 0:
+            keep = int(np.argmax(areas)) + 1
+            mask = (labels == keep).astype(np.uint8)
+
+    return mask.astype(bool)
+
+
 def compute_phase_quality(images: List[np.ndarray]) -> np.ndarray:
     """
     计算相位质量图，用于评估相位的可靠性
@@ -180,7 +255,7 @@ def compute_phase_quality(images: List[np.ndarray]) -> np.ndarray:
     return quality_map
 
 
-def quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
+def quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
     """
     使用质量图引导的空间相位解包裹
     
@@ -194,19 +269,39 @@ def quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) ->
     # 图像尺寸
     height, width = wrapped_phase.shape
     
+    # 掩膜准备
+    if mask is None:
+        mask = np.ones((height, width), dtype=bool)
+    else:
+        mask = mask.astype(bool)
+        if mask.shape != (height, width):
+            raise ValueError(f"掩膜尺寸 {mask.shape} 与相位图尺寸 {(height, width)} 不匹配")
+
     # 创建访问标记数组
     visited = np.zeros((height, width), dtype=bool)
     
     # 创建输出的解包裹相位图
     unwrapped_phase = np.zeros_like(wrapped_phase)
     
+    # 掩膜外质量置零
+    qm = quality_map.copy()
+    qm[~mask] = 0
+
     # 创建质量排序索引
-    quality_flat = quality_map.flatten()
+    quality_flat = qm.flatten()
     indices = np.argsort(-quality_flat)  # 按质量降序排序的索引
     
     # 找到质量最高的点作为种子点
-    seed_idx = indices[0]
-    seed_y, seed_x = np.unravel_index(seed_idx, (height, width))
+    # 选择掩膜内质量最高的点作为种子
+    seed_y, seed_x = None, None
+    for idx in indices:
+        y, x = np.unravel_index(idx, (height, width))
+        if mask[y, x]:
+            seed_y, seed_x = y, x
+            break
+    if seed_y is None:
+        # 掩膜为空
+        return unwrapped_phase
     
     # 标记种子点为已访问
     visited[seed_y, seed_x] = True
@@ -230,6 +325,10 @@ def quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) ->
             if ny < 0 or ny >= height or nx < 0 or nx >= width:
                 continue
             
+            # 必须在掩膜内
+            if not mask[ny, nx]:
+                continue
+
             # 如果邻域点未访问
             if not visited[ny, nx]:
                 # 计算相位差异
@@ -247,6 +346,8 @@ def quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) ->
                 # 添加到队列
                 queue.append((ny, nx))
     
+    # 掩膜外清零
+    unwrapped_phase[~mask] = 0
     return unwrapped_phase
 
 
@@ -301,13 +402,22 @@ def process_four_step_images_integrated(image_paths: List[str], output_dir: str,
     if len(images) != 4:
         raise ValueError(f"需要4张相移图像，但收到了{len(images)}张")
 
+    # 先生成掩膜（默认Otsu）
+    mask = _generate_projection_mask(images, PhaseShiftingAlgorithm.four_step, method='otsu', min_area=1000)
+    cv2.imwrite(os.path.join(output_dir, "projection_mask.png"), (mask.astype(np.uint8) * 255))
+
+    # 计算包裹相位与质量图
     wrapped_phase = compute_wrapped_phase(images, PhaseShiftingAlgorithm.four_step)
     quality_map = compute_phase_quality(images)
+
+    # 掩膜约束：掩膜外置零
+    wrapped_phase[~mask] = 0
+    quality_map[~mask] = 0
     
     visualize_phase(wrapped_phase, "Wrapped Phase", os.path.join(output_dir, "wrapped_phase.png"), 
                     show_plots, True, quality_map)
     
-    unwrapped_phase = quality_guided_unwrap(wrapped_phase, quality_map)
+    unwrapped_phase = quality_guided_unwrap(wrapped_phase, quality_map, mask=mask)
     
     visualize_phase(unwrapped_phase, "Unwrapped Phase", os.path.join(output_dir, "unwrapped_phase.png"), 
                     show_plots, False)

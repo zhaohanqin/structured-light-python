@@ -88,6 +88,64 @@ def compute_phasor_and_phase(images: List[np.ndarray], algorithm: PhaseShiftingA
     return wrapped_phase, phasor
 
 
+def _compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step) -> np.ndarray:
+    if len(images) < 3:
+        raise ValueError(f"相移图像数量不足。至少需要3张图像，但只提供了{len(images)}张。")
+    float_images = [img.astype(np.float32) for img in images]
+    n = len(float_images)
+    if algorithm == PhaseShiftingAlgorithm.three_step:
+        I1, I2, I3 = float_images[0], float_images[1], float_images[2]
+        sin_sum = (np.sqrt(3)/2) * (I2 - I3)
+        cos_sum = I1 - 0.5 * (I2 + I3)
+    elif algorithm == PhaseShiftingAlgorithm.four_step:
+        I1, I2, I3, I4 = float_images[0], float_images[1], float_images[2], float_images[3]
+        sin_sum = I2 - I4
+        cos_sum = I1 - I3
+    elif algorithm == PhaseShiftingAlgorithm.n_step:
+        delta = 2 * np.pi / n
+        sin_sum = sum(float_images[i] * np.sin(i * delta) for i in range(n))
+        cos_sum = sum(float_images[i] * np.cos(i * delta) for i in range(n))
+    else:
+        raise ValueError(f"不支持的相移算法: {algorithm}")
+    amplitude = np.sqrt(sin_sum**2 + cos_sum**2) * (2 / n)
+    return amplitude
+
+
+def _generate_projection_mask(images: List[np.ndarray], 
+                             algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
+                             method: str = 'otsu', 
+                             thresh_rel: Optional[float] = None, 
+                             min_area: int = 500) -> np.ndarray:
+    from skimage import morphology
+    import skimage.filters as filters
+    amplitude = _compute_amplitude_from_images(images, algorithm)
+    a_norm = (amplitude - amplitude.min()) / (amplitude.max() - amplitude.min() + 1e-9)
+    a8 = (a_norm * 255).astype(np.uint8)
+    if method == 'otsu':
+        th = filters.threshold_otsu(a8)
+        mask = a8 >= th
+    elif method == 'adaptive':
+        mask = cv2.adaptiveThreshold(a8, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 51, -5) > 0
+    elif method == 'relative':
+        if thresh_rel is None:
+            thresh_rel = 0.2
+        th = np.percentile(a8, 100 * (1 - thresh_rel))
+        mask = a8 >= th
+    else:
+        raise ValueError(f"不支持的阈值化方法: {method}")
+    mask = morphology.remove_small_objects(mask, min_size=min_area)
+    mask = morphology.remove_small_holes(mask, area_threshold=min_area)
+    mask = morphology.binary_closing(mask, morphology.disk(5))
+    mask = mask.astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(mask)
+    if num_labels > 1:
+        areas = [(labels == i).sum() for i in range(1, num_labels)]
+        if len(areas) > 0:
+            keep = int(np.argmax(areas)) + 1
+            mask = (labels == keep).astype(np.uint8)
+    return mask.astype(bool)
+
 def compute_phase_quality(images: List[np.ndarray]) -> np.ndarray:
     """
     计算相位质量图
@@ -134,7 +192,8 @@ def multi_frequency_unwrap(
     quality_maps: Optional[Dict[int, np.ndarray]] = None,
     filter_kernel_size: int = 9,
     direction: str = 'horizontal',
-    direction_output_dir: Optional[str] = None
+    direction_output_dir: Optional[str] = None,
+    mask: Optional[np.ndarray] = None
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     使用多频外差法（Hierarchical Heterodyne）解包裹相位。
@@ -185,6 +244,13 @@ def multi_frequency_unwrap(
             C_equiv = C_high * np.conj(C_low)
             p_equiv_wrapped = np.angle(C_equiv)
 
+            # 掩膜外置零，确保仅在有效区域运算
+            if mask is not None:
+                C_equiv = C_equiv.copy()
+                p_equiv_wrapped = p_equiv_wrapped.copy()
+                C_equiv[~mask] = 0
+                p_equiv_wrapped[~mask] = 0
+
             print(f"    - {f_high} Hz - {f_low} Hz -> 等效频率: {f_equiv} Hz")
             
             next_freqs.append(f_equiv)
@@ -202,6 +268,12 @@ def multi_frequency_unwrap(
     # 获取频率为1的基准相位
     base_unwrapped_phase = levels[-1]['phases'][0].copy()
     print(f"  使用频率为 {levels[-1]['freqs'][0]} Hz 的等效相位作为展开基准。")
+
+    # 准备掩膜
+    if mask is None:
+        mask_internal = np.ones_like(base_unwrapped_phase, dtype=bool)
+    else:
+        mask_internal = mask.astype(bool)
 
     # 自动检测相位方向
     # 为提高方向判断的稳定性，我们对基准相位进行一次强力滤波，并仅将该滤波结果用于方向判断
@@ -226,9 +298,16 @@ def multi_frequency_unwrap(
         # 使用最高频率的质量图
         highest_freq = sorted_freqs[0]
         quality_map = quality_maps[highest_freq]
+
+    # 掩膜外质量置零
+    if mask_internal is not None:
+        if quality_map.shape != mask_internal.shape:
+            raise ValueError("quality_map 与 mask 尺寸不一致")
+        quality_map = quality_map.copy()
+        quality_map[~mask_internal] = 0
     
     # 初始化掩码，所有像素都是有效的
-    valid_mask = np.ones((height, width), dtype=bool)
+    valid_mask = mask_internal.copy()
     
     # 初始化k_map字典，用于存储每个频率的条纹阶数
     k_maps = {}
@@ -247,12 +326,12 @@ def multi_frequency_unwrap(
     # 根据预期方向，确保梯度主体是正向的
     if direction == 'horizontal':
         # 水平方向，应该主要是x方向的正梯度
-        if np.median(gx) < 0:
+        if np.median(gx[mask_internal]) < 0:
             print("  基准相位梯度方向不符合预期，进行翻转。")
             unwrapped_phase = -unwrapped_phase + np.max(-unwrapped_phase)  # 翻转并保持非负
     else:  # vertical
         # 垂直方向，应该主要是y方向的正梯度
-        if np.median(gy) < 0:
+        if np.median(gy[mask_internal]) < 0:
             print("  基准相位梯度方向不符合预期，进行翻转。")
             unwrapped_phase = -unwrapped_phase + np.max(-unwrapped_phase)  # 翻转并保持非负
     
@@ -261,10 +340,12 @@ def multi_frequency_unwrap(
     if direction == 'horizontal':
         # 水平方向，使用左侧10%区域的最小值作为零点
         left_region = unwrapped_phase[:, :int(width * 0.1)]
+        left_region = left_region[mask_internal[:, :int(width * 0.1)]] if np.any(mask_internal) else left_region
         zero_ref = np.percentile(left_region, 5)  # 使用低百分位数，避免异常值影响
     else:
         # 垂直方向，使用顶部10%区域的最小值作为零点
         top_region = unwrapped_phase[:int(height * 0.1), :]
+        top_region = top_region[mask_internal[:int(height * 0.1), :]] if np.any(mask_internal) else top_region
         zero_ref = np.percentile(top_region, 5)  # 使用低百分位数，避免异常值影响
     
     # 对齐零点，确保基准相位从接近0开始
@@ -314,6 +395,9 @@ def multi_frequency_unwrap(
             # 在左侧5%区域内寻找高质量点
             left_edge = int(width * 0.05)
             edge_region_quality = combined_quality[:, :left_edge]
+            if mask_internal is not None:
+                edge_region_quality = edge_region_quality.copy()
+                edge_region_quality[~mask_internal[:, :left_edge]] = 0
             
             # 找出质量较高的点（超过中值的点）
             threshold = np.median(edge_region_quality)
@@ -339,6 +423,9 @@ def multi_frequency_unwrap(
             # 在上侧5%区域内寻找高质量点
             top_edge = int(height * 0.05)
             edge_region_quality = combined_quality[:top_edge, :]
+            if mask_internal is not None:
+                edge_region_quality = edge_region_quality.copy()
+                edge_region_quality[~mask_internal[:top_edge, :]] = 0
             
             # 找出质量较高的点（超过中值的点）
             threshold = np.median(edge_region_quality)
@@ -384,6 +471,10 @@ def multi_frequency_unwrap(
                 if not (0 <= ny < height and 0 <= nx < width):
                     continue
                 
+                # 必须在掩膜内
+                if not valid_mask[ny, nx]:
+                    continue
+
                 # 如果已访问，跳过
                 if visited[ny, nx]:
                     continue
@@ -415,6 +506,8 @@ def multi_frequency_unwrap(
         
         # 【改进19】使用修正后的k值进行相位展开
         unwrapped_phase = phase_high_wrapped + 2 * np.pi * k
+        # 掩膜外置零
+        unwrapped_phase[~valid_mask] = 0
         
         # 【改进20】保存当前频率的k_map
         k_maps[freq_high] = k
@@ -573,11 +666,15 @@ def multi_frequency_unwrap(
     if direction == 'horizontal':
         # 水平方向，以最左侧20%区域的中位数为基准
         left_region = unwrapped_phase[:, :int(width * 0.2)]
-        zero_ref = np.median(left_region)
+        if np.any(valid_mask):
+            left_region = left_region[valid_mask[:, :int(width * 0.2)]]
+        zero_ref = np.median(left_region) if left_region.size > 0 else 0.0
     else:
         # 垂直方向，以最顶部20%区域的中位数为基准
         top_region = unwrapped_phase[:int(height * 0.2), :]
-        zero_ref = np.median(top_region)
+        if np.any(valid_mask):
+            top_region = top_region[valid_mask[:int(height * 0.2), :]]
+        zero_ref = np.median(top_region) if top_region.size > 0 else 0.0
     
     # 偏移整个相位图，使得起始边缘的相位接近于0
     unwrapped_phase -= zero_ref
@@ -585,6 +682,8 @@ def multi_frequency_unwrap(
     
     # 确保没有负值
     unwrapped_phase[unwrapped_phase < 0] = 0
+    # 掩膜外置零（最终保证）
+    unwrapped_phase[~valid_mask] = 0
 
     # 【新增改进29】应用额外平滑以确保结果更加平滑
     # 使用更小的滤波核进行最终平滑，保留边缘细节
@@ -867,6 +966,7 @@ def process_multi_frequency_images(
     wrapped_phases = {}
     phasors = {}
     quality_maps = {}
+    masks = {}
     frequencies = sorted(frequency_data.keys())
 
     print("正在计算各个频率的包裹相位...")
@@ -877,6 +977,11 @@ def process_multi_frequency_images(
         images = [cv2.imread(path, cv2.IMREAD_GRAYSCALE) for path in image_paths]
         if any(img is None for img in images):
             raise ValueError(f"无法加载频率 {freq} 的一张或多张图像")
+        # 生成掩膜并保存
+        mask = _generate_projection_mask(images, PhaseShiftingAlgorithm.n_step, method='otsu', min_area=800)
+        freq_output_dir = os.path.join(output_dir, f"freq_{freq}")
+        os.makedirs(freq_output_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(freq_output_dir, "projection_mask.png"), (mask.astype(np.uint8) * 255))
         
         # 计算包裹相位、复数相量和质量图（使用N步算法）
         wrapped_phase, phasor = compute_phasor_and_phase(images, PhaseShiftingAlgorithm.n_step)
@@ -894,6 +999,11 @@ def process_multi_frequency_images(
             phasor = np.conj(phasor)
         
         quality_map = compute_phase_quality(images)
+
+        # 掩膜约束：掩膜外置零
+        wrapped_phase[~mask] = 0
+        quality_map[~mask] = 0
+        phasor[~mask] = 0
         
         # 【重要修正】在将包裹相位送入多频算法前，不再需要修正方向。
         # 方向一致性将在 multi_frequency_unwrap 内部通过更稳健的方式保证。
@@ -902,10 +1012,9 @@ def process_multi_frequency_images(
         wrapped_phases[freq] = wrapped_phase
         phasors[freq] = phasor
         quality_maps[freq] = quality_map
+        masks[freq] = mask
 
         # 可选：保存每个频率的中间结果
-        freq_output_dir = os.path.join(output_dir, f"freq_{freq}")
-        os.makedirs(freq_output_dir, exist_ok=True)
         visualize_wrapped_phase(
             wrapped_phase, quality_map,
             title=f"频率 {freq} 的包裹相位",
@@ -914,18 +1023,26 @@ def process_multi_frequency_images(
         )
         np.save(os.path.join(freq_output_dir, "wrapped_phase.npy"), wrapped_phase)
         np.save(os.path.join(freq_output_dir, "quality_map.npy"), quality_map)
+        np.save(os.path.join(freq_output_dir, "mask.npy"), mask.astype(np.uint8))
 
     print("\n开始进行多频解包裹...")
+    # 组合全局掩膜：仅在所有频率的有效区域内解包裹
+    if len(masks) > 0:
+        combined_mask = None
+        for f in frequencies:
+            combined_mask = masks[f] if combined_mask is None else (combined_mask & masks[f])
+    else:
+        combined_mask = None
     if method == "multi_freq":
         unwrapped_phase, k_map = multi_frequency_unwrap(
             wrapped_phases, phasors, frequencies, quality_maps, filter_kernel_size, direction,
-            direction_output_dir=output_dir
+            direction_output_dir=output_dir, mask=combined_mask
         )
     elif method == "temporal":
         print("警告: 'temporal' 方法已被弃用，将使用 'multi_freq' 方法执行。")
         unwrapped_phase, k_map = multi_frequency_unwrap(
             wrapped_phases, phasors, frequencies, quality_maps, filter_kernel_size, direction,
-            direction_output_dir=output_dir
+            direction_output_dir=output_dir, mask=combined_mask
         )
     else:
         raise ValueError(f"不支持的多频解包裹方法: {method}")
@@ -936,12 +1053,16 @@ def process_multi_frequency_images(
         # 水平方向，以最左侧一列为基准
         # 【改进】使用左侧20%区域的平均值，而不是仅第一列，以增强稳定性
         left_region = unwrapped_phase[:, :int(unwrapped_phase.shape[1] * 0.2)]
-        zero_ref = np.mean(left_region[left_region > 0]) if np.any(left_region > 0) else 0
+        if combined_mask is not None:
+            left_region = left_region[combined_mask[:, :int(unwrapped_phase.shape[1] * 0.2)]]
+        zero_ref = np.mean(left_region[left_region > 0]) if left_region.size > 0 and np.any(left_region > 0) else 0
     else: # vertical
         # 垂直方向，以最顶侧一行为基准
         # 【改进】使用顶部20%区域的平均值，而不是仅第一行，以增强稳定性
         top_region = unwrapped_phase[:int(unwrapped_phase.shape[0] * 0.2), :]
-        zero_ref = np.mean(top_region[top_region > 0]) if np.any(top_region > 0) else 0
+        if combined_mask is not None:
+            top_region = top_region[combined_mask[:int(unwrapped_phase.shape[0] * 0.2), :]]
+        zero_ref = np.mean(top_region[top_region > 0]) if top_region.size > 0 and np.any(top_region > 0) else 0
     
     unwrapped_phase -= zero_ref
     print(f"最终相位修正：已将相位零点对齐到图像起始边缘 (参考值: {zero_ref:.2f})。")
@@ -980,6 +1101,9 @@ def process_multi_frequency_images(
     
     # 【新增全局改进C】最终确保没有负值和极值点
     unwrapped_phase = np.maximum(unwrapped_phase, 0)
+    # 掩膜外置零
+    if combined_mask is not None:
+        unwrapped_phase[~combined_mask] = 0
     
     # 检测并处理孤立的极值点
     local_max = unwrapped_phase > np.roll(unwrapped_phase, 1, axis=0)
@@ -1022,6 +1146,8 @@ def process_multi_frequency_images(
         k_map = np.round((unwrapped_phase - p_high_final_wrapped) / (2 * np.pi))
         # 同样确保k_map非负
         k_map[k_map < 0] = 0
+        if combined_mask is not None:
+            k_map[~combined_mask] = 0
         print("最终k值已根据边缘对齐的非负相位重新计算，确保数据一致性。")
     
     # 可视化并保存最终结果

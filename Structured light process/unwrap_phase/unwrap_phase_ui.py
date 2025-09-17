@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QComboBox, QGroupBox, 
     QRadioButton, QButtonGroup, QMessageBox, QProgressBar,
     QScrollArea, QSplitter, QFrame, QTabWidget, QStackedWidget,
-    QSpinBox
+    QSpinBox, QSlider, QDoubleSpinBox
 )
 from PySide6.QtGui import QPixmap, QImage, QColor, QPalette, QFont, QPainter, QPen
 from PySide6.QtCore import Qt, QSize, Signal, Slot, QThread
@@ -52,13 +52,17 @@ class UnwrappingWorker(QThread):
                 vertical_images: Optional[List[str]] = None,
                 unwrap_direction: UnwrapDirection = UnwrapDirection.BOTH,
                 unwrap_method: str = "quality_guided",
-                output_dir: str = "output"):
+                output_dir: str = "output",
+                mask_method: str = "otsu",
+                mask_confidence: float = 0.5):
         super().__init__()
         self.horizontal_images = horizontal_images
         self.vertical_images = vertical_images
         self.unwrap_direction = unwrap_direction
         self.unwrap_method = unwrap_method
         self.output_dir = output_dir
+        self.mask_method = mask_method
+        self.mask_confidence = mask_confidence
         
     def run(self):
         try:
@@ -79,7 +83,10 @@ class UnwrappingWorker(QThread):
                     self.horizontal_images, 
                     output_dir=horizontal_dir, 
                     method=self.unwrap_method,
-                    show_plots=False  # 不显示图形，只保存
+                    show_plots=False,  # 不显示图形，只保存
+                    use_mask=True,
+                    mask_method=self.mask_method,
+                    mask_confidence=self.mask_confidence
                 )
                 if processed_data:
                     result["horizontal"] = {
@@ -99,8 +106,11 @@ class UnwrappingWorker(QThread):
                 processed_data = unwrap_phase.process_single_frequency_images(
                     self.vertical_images, 
                     output_dir=vertical_dir, 
-            method=self.unwrap_method,
-                    show_plots=False  # 不显示图形，只保存
+                    method=self.unwrap_method,
+                    show_plots=False,  # 不显示图形，只保存
+                    use_mask=True,
+                    mask_method=self.mask_method,
+                    mask_confidence=self.mask_confidence
                 )
                 if processed_data:
                     result["vertical"] = {
@@ -385,6 +395,8 @@ class PhaseUnwrapperUI(QMainWindow):
         self.vertical_images = []    # 垂直方向（水平条纹）图像
         self.unwrap_direction = UnwrapDirection.BOTH
         self.unwrap_method = "quality_guided"
+        self.mask_method = "otsu"
+        self.mask_confidence = 0.5  # 掩膜置信度，范围0.1-0.9
         self.output_dir = "phase_unwrap_results"
         self.combined_viewer_window = None # 用于持有对新窗口的引用
         
@@ -544,7 +556,6 @@ class PhaseUnwrapperUI(QMainWindow):
         image_selection_layout.addWidget(select_vertical_btn)
         
         image_selection_group.setLayout(image_selection_layout)
-        control_layout.addWidget(image_selection_group)
         
         # 解包裹方向选择组
         direction_group = QGroupBox("解包裹方向")
@@ -569,7 +580,6 @@ class PhaseUnwrapperUI(QMainWindow):
         direction_button_group.idClicked.connect(self.update_unwrap_direction)
         
         direction_group.setLayout(direction_layout)
-        control_layout.addWidget(direction_group)
         
         # 解包裹方法选择组
         method_group = QGroupBox("解包裹方法与参数")
@@ -587,13 +597,49 @@ class PhaseUnwrapperUI(QMainWindow):
         
         # 创建下拉菜单
         self.method_combo = QComboBox()
-        self.method_combo.addItem("质量引导法", "quality_guided")
-        self.method_combo.addItem("Skimage 算法", "skimage")
+        self.method_combo.addItem("质量引导法 (原始)", "quality_guided")
+        self.method_combo.addItem("改进质量引导法", "improved_quality_guided")
+        self.method_combo.addItem("鲁棒解包裹法", "robust")
         self.method_combo.currentIndexChanged.connect(self.update_unwrap_method)
-        self.method_combo.setToolTip("选择用于执行相位解包裹的核心算法。")
+        self.method_combo.setToolTip("选择用于执行相位解包裹的核心算法。\n"
+                                   "• 质量引导法(原始): 基础的质量引导解包裹\n"
+                                   "• 改进质量引导法: 结合相位梯度的改进算法\n"
+                                   "• 鲁棒解包裹法: 结合相位跳跃的鲁棒算法")
         
         method_layout.addWidget(QLabel("选择解包裹算法:"))
         method_layout.addWidget(self.method_combo)
+
+        # 掩膜方法选择
+        method_layout.addWidget(QLabel("掩膜生成方法:"))
+        self.mask_combo = QComboBox()
+        self.mask_combo.addItem("Otsu 自适应阈值", "otsu")
+        self.mask_combo.addItem("自适应阈值 (Gaussian)", "adaptive")
+        self.mask_combo.addItem("相对百分位阈值", "relative")
+        self.mask_combo.setCurrentIndex(0)
+        self.mask_combo.currentIndexChanged.connect(self.update_mask_method)
+        self.mask_combo.setToolTip("选择用于生成投影区域掩膜的方法：\n"
+                                   "• Otsu 自适应阈值: 通常效果最好\n"
+                                   "• 自适应阈值(Gaussian): 光照不均时更稳健\n"
+                                   "• 相对百分位阈值: 以比例控制掩膜大小")
+        method_layout.addWidget(self.mask_combo)
+        
+        # 掩膜置信度（仅数值输入）
+        confidence_layout = QHBoxLayout()
+        confidence_layout.addWidget(QLabel("掩膜置信度:"))
+        self.confidence_spinbox = QDoubleSpinBox()
+        self.confidence_spinbox.setRange(0.1, 0.9)
+        self.confidence_spinbox.setSingleStep(0.1)
+        self.confidence_spinbox.setDecimals(1)
+        self.confidence_spinbox.setValue(0.5)
+        self.confidence_spinbox.valueChanged.connect(self.update_mask_confidence_from_spinbox)
+        self.confidence_spinbox.setToolTip("输入 0.1-0.9 的数值以设置掩膜置信度")
+        confidence_layout.addWidget(self.confidence_spinbox)
+        method_layout.addLayout(confidence_layout)
+        
+        # 置信度说明标签
+        self.confidence_info_label = QLabel("推荐范围: 0.4-0.6 (平衡掩膜质量)")
+        self.confidence_info_label.setStyleSheet("color: #666; font-size: 11px; font-style: italic;")
+        method_layout.addWidget(self.confidence_info_label)
         
         # 输出目录设置
         method_layout.addWidget(QLabel("输出目录:"))
@@ -610,7 +656,6 @@ class PhaseUnwrapperUI(QMainWindow):
         method_layout.addLayout(output_dir_layout)
         
         method_group.setLayout(method_layout)
-        control_layout.addWidget(method_group)
         
         # 操作按钮组
         operation_group = QGroupBox("操作")
@@ -636,7 +681,18 @@ class PhaseUnwrapperUI(QMainWindow):
         operation_layout.addWidget(reset_btn)
         
         operation_group.setLayout(operation_layout)
-        control_layout.addWidget(operation_group)
+
+        # 顶部三列布局，缓解拥挤
+        left_column = QVBoxLayout()
+        left_column.addWidget(image_selection_group)
+        left_column.addWidget(direction_group)
+        left_widget = QWidget()
+        left_widget.setLayout(left_column)
+
+        # 通过伸缩因子让三列随着窗口宽度自适应填满
+        control_layout.addWidget(left_widget, 2)
+        control_layout.addWidget(method_group, 3)
+        control_layout.addWidget(operation_group, 1)
         
         return control_layout
     
@@ -782,6 +838,33 @@ class PhaseUnwrapperUI(QMainWindow):
     def update_unwrap_method(self, index: int):
         """更新解包裹方法"""
         self.unwrap_method = self.method_combo.itemData(index)
+
+    @Slot(int)
+    def update_mask_method(self, index: int):
+        """更新掩膜方法"""
+        self.mask_method = self.mask_combo.itemData(index)
+    
+    @Slot(float)
+    def update_mask_confidence_from_spinbox(self, value: float):
+        """从数值框更新掩膜置信度"""
+        self.mask_confidence = value
+        self.update_confidence_info()
+    
+    def update_confidence_info(self):
+        """更新置信度说明信息"""
+        confidence = self.mask_confidence
+        if confidence < 0.4:
+            info = f"当前值: {confidence:.1f} (宽松掩膜，可能包含更多噪声区域)"
+            color = "#ff6b6b"  # 红色
+        elif confidence <= 0.6:
+            info = f"当前值: {confidence:.1f} (推荐范围，平衡的掩膜质量)"
+            color = "#51cf66"  # 绿色
+        else:
+            info = f"当前值: {confidence:.1f} (严格掩膜，可能丢失部分有效区域)"
+            color = "#ffd43b"  # 黄色
+        
+        self.confidence_info_label.setText(info)
+        self.confidence_info_label.setStyleSheet(f"color: {color}; font-size: 11px; font-style: italic;")
     
     @Slot()
     def select_output_dir(self):
@@ -815,7 +898,9 @@ class PhaseUnwrapperUI(QMainWindow):
             vertical_images=self.vertical_images if self.unwrap_direction in [UnwrapDirection.VERTICAL, UnwrapDirection.BOTH] else None,
             unwrap_direction=self.unwrap_direction,
             unwrap_method=self.unwrap_method,
-            output_dir=self.output_dir
+            output_dir=self.output_dir,
+            mask_method=self.mask_method,
+            mask_confidence=self.mask_confidence
         )
         
         # 连接信号
