@@ -47,6 +47,8 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from enum import Enum
 from typing import List, Dict, Tuple, Optional
+from skimage import morphology
+import skimage.filters as filters
 
 try:
     from tqdm import tqdm  # 导入进度条库
@@ -170,42 +172,68 @@ def _compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShi
     return amplitude
 
 
-def _generate_projection_mask(images: List[np.ndarray], 
+def generate_projection_mask(images: List[np.ndarray], 
                              algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
                              method: str = 'otsu', 
                              thresh_rel: Optional[float] = None, 
-                             min_area: int = 500) -> np.ndarray:
+                             min_area: int = 500,
+                             confidence: float = 0.5,
+                             border_trim_px: int = 10) -> np.ndarray:
     """
-    基于相移图像生成投影区域掩膜（True为有效投影区域）
+    基于相移图像生成投影区域掩膜（True为有效投影区域），支持置信度调节。
+    参考 unwrap_phase.generate_projection_mask 的实现，使掩膜对投影区域更鲁棒。
     """
-    from skimage import morphology
-    import skimage.filters as filters
+    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
+    I_max = np.max(imgs, axis=2)
+    I_min = np.min(imgs, axis=2)
+    I_mean = np.mean(imgs, axis=2)
 
-    amplitude = _compute_amplitude_from_images(images, algorithm)
-    a_norm = (amplitude - amplitude.min()) / (amplitude.max() - amplitude.min() + 1e-9)
-    a8 = (a_norm * 255).astype(np.uint8)
+    A = (I_max - I_min) / 2.0
+    M = (I_max - I_min) / (I_max + I_min + 1e-9)
+
+    A_norm = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    M_norm = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    I_norm = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     if method == 'otsu':
-        th = filters.threshold_otsu(a8)
-        mask = a8 >= th
-    elif method == 'adaptive':
-        mask = cv2.adaptiveThreshold(a8, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY, 51, -5) > 0
+        _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        th_I = np.percentile(I_norm, 50)
+        mask_I = (I_norm > th_I).astype(np.uint8) * 255
+        mask = np.logical_or(mask_A > 0, mask_M > 0)
+        mask = np.logical_and(mask, mask_I > 0)
     elif method == 'relative':
         if thresh_rel is None:
             thresh_rel = 0.2
-        th = np.percentile(a8, 100 * (1 - thresh_rel))
-        mask = a8 >= th
+        adjusted_thresh_rel = float(thresh_rel) * (2 - float(confidence))
+        th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
+        th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
+        th_I = np.percentile(I_norm, 50)
+        mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
+        mask = np.logical_and(mask, I_norm > th_I)
     else:
         raise ValueError(f"不支持的阈值化方法: {method}")
 
     # 形态学清理
+    mask = morphology.binary_closing(mask, morphology.disk(7))
     mask = morphology.remove_small_objects(mask, min_size=min_area)
     mask = morphology.remove_small_holes(mask, area_threshold=min_area)
-    mask = morphology.binary_closing(mask, morphology.disk(5))
     mask = mask.astype(np.uint8)
 
-    # 保留最大连通区域
+    # 边界收缩，避免边界伪影
+    if border_trim_px and border_trim_px > 0:
+        h, w = mask.shape
+        bt = min(border_trim_px, min(h // 10, w // 10))
+        if bt > 0:
+            mask[:bt, :] = 0
+            mask[-bt:, :] = 0
+            mask[:, :bt] = 0
+            mask[:, -bt:] = 0
+
+    # 轻微膨胀回收边缘
+    mask = cv2.dilate(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5)))
+
+    # 保留最大连通分量
     num_labels, labels = cv2.connectedComponents(mask)
     if num_labels > 1:
         areas = [(labels == i).sum() for i in range(1, num_labels)]
@@ -379,7 +407,9 @@ def visualize_phase(phase_data: np.ndarray, title: str, save_path: str, show_plo
 
 
 def process_four_step_images_integrated(image_paths: List[str], output_dir: str, 
-                                        show_plots: bool = True, return_quality: bool = False):
+                                       show_plots: bool = True, return_quality: bool = False,
+                                       mask_method: str = 'otsu', mask_confidence: float = 0.5,
+                                       min_area: int = 1000):
     """
     处理四步相移图像并生成解包裹相位 (集成版本)
     
@@ -402,8 +432,8 @@ def process_four_step_images_integrated(image_paths: List[str], output_dir: str,
     if len(images) != 4:
         raise ValueError(f"需要4张相移图像，但收到了{len(images)}张")
 
-    # 先生成掩膜（默认Otsu）
-    mask = _generate_projection_mask(images, PhaseShiftingAlgorithm.four_step, method='otsu', min_area=1000)
+    # 先生成掩膜（可调方法与置信度）
+    mask = generate_projection_mask(images, PhaseShiftingAlgorithm.four_step, method=mask_method, min_area=min_area, confidence=mask_confidence)
     cv2.imwrite(os.path.join(output_dir, "projection_mask.png"), (mask.astype(np.uint8) * 255))
 
     # 计算包裹相位与质量图
@@ -1547,7 +1577,9 @@ def calibrate_projector_with_camera_global(self, camera_matrix, camera_distortio
     return self.projector_matrix, self.projector_dist, self.R, self.T, proj_error
 
 def process_n_step_images_integrated(image_paths: List[str], output_dir: str, 
-                                     show_plots: bool = True, return_quality: bool = False):
+                                     show_plots: bool = True, return_quality: bool = False,
+                                     mask_method: str = 'otsu', mask_confidence: float = 0.5,
+                                     min_area: int = 500):
     """
     处理N步相移图像并生成解包裹相位 (通用版本)
     
@@ -1577,13 +1609,32 @@ def process_n_step_images_integrated(image_paths: List[str], output_dir: str,
     # 计算平均强度图作为基准图
     base_image = np.mean(np.stack([img.astype(np.float32) for img in images], axis=0), axis=0).astype(np.uint8)
 
+    # 先生成掩膜并保存
+    mask = generate_projection_mask(images, PhaseShiftingAlgorithm.n_step, method=mask_method, min_area=min_area, confidence=mask_confidence)
+    cv2.imwrite(os.path.join(output_dir, "projection_mask.png"), (mask.astype(np.uint8) * 255))
+
+    # 保存掩膜特征图，便于诊断
+    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
+    I_max = np.max(imgs, axis=2)
+    I_min = np.min(imgs, axis=2)
+    I_mean = np.mean(imgs, axis=2)
+    A = (I_max - I_min) / 2.0
+    M = (I_max - I_min) / (I_max + I_min + 1e-9)
+    cv2.imwrite(os.path.join(output_dir, "Amplitude.png"), cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+    cv2.imwrite(os.path.join(output_dir, "Modulation.png"), cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+    cv2.imwrite(os.path.join(output_dir, "MeanIntensity.png"), cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+
+    # 计算包裹相位与质量图，并在掩膜外置零
     wrapped_phase = compute_wrapped_phase(images, PhaseShiftingAlgorithm.n_step)
     quality_map = compute_phase_quality(images)
+    wrapped_phase[~mask] = 0
+    quality_map[~mask] = 0
     
     visualize_phase(wrapped_phase, "Wrapped Phase", os.path.join(output_dir, "wrapped_phase.png"), 
                     show_plots, True, quality_map)
     
-    unwrapped_phase = quality_guided_unwrap(wrapped_phase, quality_map)
+    # 在掩膜内进行质量引导解包裹
+    unwrapped_phase = quality_guided_unwrap(wrapped_phase, quality_map, mask=mask)
     
     visualize_phase(unwrapped_phase, "Unwrapped Phase", os.path.join(output_dir, "unwrapped_phase.png"), 
                     show_plots, False)
@@ -1602,7 +1653,8 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
                                    phase_images_folder, board_type="chessboard", chessboard_size=(9, 6),
                                    square_size=20.0, output_folder=None, visualize=True,
                                    global_optimization=True, sampling_step=5, adaptive_threshold=True,
-                                   n_steps=4, print_func=print):
+                                   n_steps=4, print_func=print,
+                                   mask_method: str = 'otsu', mask_confidence: float = 0.5):
     """
     基于相位解包裹的投影仪标定主函数 (新版，支持N步相移和子文件夹)
 
@@ -1709,13 +1761,15 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
             # 处理水平条纹
             print_func("  - 解包裹水平相位...")
             h_unwrapped, h_quality, _, _ = process_n_step_images_integrated(
-                h_paths, h_output_dir, show_plots=visualize, return_quality=True
+                h_paths, h_output_dir, show_plots=visualize, return_quality=True,
+                mask_method=mask_method, mask_confidence=mask_confidence
             )
             
             # 处理垂直条纹
             print_func("  - 解包裹垂直相位...")
             v_unwrapped, v_quality, _, base_image_v = process_n_step_images_integrated(
-                v_paths, v_output_dir, show_plots=visualize, return_quality=True
+                v_paths, v_output_dir, show_plots=visualize, return_quality=True,
+                mask_method=mask_method, mask_confidence=mask_confidence
             )
 
             # 过滤低质量相位点

@@ -102,7 +102,9 @@ class CalibrationThread(QThread):
                 adaptive_threshold=self.params.get("adaptive_threshold"),
                 n_steps=self.params.get("n_steps"),
                 print_func=custom_print, # 传递自定义打印函数
-                cancellation_check_func=self.is_cancelled # 传递取消检查函数
+                cancellation_check_func=self.is_cancelled, # 传递取消检查函数
+                mask_method=self.params.get("mask_method", 'otsu'),
+                mask_confidence=self.params.get("mask_confidence", 0.5)
             )
             
             # 发送完成信息
@@ -574,6 +576,22 @@ class ProjectorCalibrationGUI(QMainWindow):
         self.adaptive_threshold_check.setChecked(True)
         self.adaptive_threshold_check.setToolTip("自动根据当前图像的质量来确定一个阈值，以过滤掉低质量的相位点。")
         layout.addRow("", self.adaptive_threshold_check)
+
+        # 掩膜方法
+        self.mask_method_combo = QComboBox()
+        self.mask_method_combo.addItem("Otsu 自适应阈值", "otsu")
+        self.mask_method_combo.addItem("相对百分位阈值", "relative")
+        self.mask_method_combo.setToolTip("用于生成投影区域掩膜的方法。与相位解包裹流程一致。")
+        layout.addRow("掩膜生成方法:", self.mask_method_combo)
+
+        # 掩膜置信度（0.1-0.9）
+        self.mask_confidence_spin = QDoubleSpinBox()
+        self.mask_confidence_spin.setRange(0.1, 0.9)
+        self.mask_confidence_spin.setSingleStep(0.1)
+        self.mask_confidence_spin.setDecimals(1)
+        self.mask_confidence_spin.setValue(0.5)
+        self.mask_confidence_spin.setToolTip("调节掩膜严格程度：值越高越严格，区域越小。")
+        layout.addRow("掩膜置信度:", self.mask_confidence_spin)
         
         # 可视化结果
         self.visualize_check = QCheckBox("显示过程可视化图像")
@@ -728,7 +746,9 @@ class ProjectorCalibrationGUI(QMainWindow):
             "global_optimization": self.global_opt_check.isChecked(),
             "sampling_step": self.sampling_step_spin.value(),
             "adaptive_threshold": self.adaptive_threshold_check.isChecked(),
-            "n_steps": self.n_steps_spin.value()
+            "n_steps": self.n_steps_spin.value(),
+            "mask_method": self.mask_method_combo.currentData(),
+            "mask_confidence": self.mask_confidence_spin.value()
         }
         
         return params
