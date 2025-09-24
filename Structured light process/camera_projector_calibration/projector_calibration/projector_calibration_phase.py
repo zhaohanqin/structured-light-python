@@ -172,76 +172,354 @@ def _compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShi
     return amplitude
 
 
+def compute_phasor_and_phase_masked(images: List[np.ndarray], mask: np.ndarray, algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    在掩膜约束下计算包裹相位和对应的复数形式（相量）
+    只在掩膜区域内进行计算，掩膜外区域设为0
+    
+    参数:
+        images: 相移图像列表
+        mask: 投影区域掩膜，True表示需要计算的区域
+        algorithm: 相移算法类型
+    
+    返回:
+        wrapped_phase: 包裹相位图，掩膜外区域为0
+        phasor: 相量图，掩膜外区域为0
+    """
+    if len(images) < 3:
+        raise ValueError(f"相移图像数量不足。至少需要3张图像，但只提供了{len(images)}张。")
+    
+    # 确保掩膜是布尔类型
+    mask = mask.astype(bool)
+    
+    # 创建掩膜约束的图像
+    masked_images = []
+    for img in images:
+        masked_img = img.copy().astype(np.float32)
+        masked_img[~mask] = 0  # 掩膜外区域设为0
+        masked_images.append(masked_img)
+    
+    # 使用掩膜约束的图像计算包裹相位
+    float_images = masked_images
+    n = len(float_images)
+    
+    # 统一使用 sum(I*sin) 和 sum(I*cos) 的形式
+    sin_sum = 0
+    cos_sum = 0
+
+    # 假设相移是 +k*delta 的形式
+    if algorithm == PhaseShiftingAlgorithm.three_step:
+        I1, I2, I3 = float_images[0], float_images[1], float_images[2]
+        # 三步相移算法的标准实现
+        sin_sum = (np.sqrt(3)/2) * (I2 - I3)
+        cos_sum = I1 - 0.5 * (I2 + I3)
+    elif algorithm == PhaseShiftingAlgorithm.four_step:
+        I1, I2, I3, I4 = float_images[0], float_images[1], float_images[2], float_images[3]
+        sin_sum = I2 - I4
+        cos_sum = I1 - I3
+    elif algorithm == PhaseShiftingAlgorithm.n_step:
+        delta = 2 * np.pi / n
+        sin_sum = sum(float_images[i] * np.sin(i * delta) for i in range(n))
+        cos_sum = sum(float_images[i] * np.cos(i * delta) for i in range(n))
+    else:
+        raise ValueError(f"不支持的相移算法: {algorithm}")
+    
+    # 计算包裹相位和相量
+    wrapped_phase = np.arctan2(-sin_sum, cos_sum)
+    phasor = cos_sum - 1j * sin_sum
+    
+    # 确保掩膜外区域为0
+    wrapped_phase[~mask] = 0
+    phasor[~mask] = 0
+    
+    return wrapped_phase, phasor
+
+
+def compute_phase_quality_masked(images: List[np.ndarray], mask: np.ndarray) -> np.ndarray:
+    """
+    在掩膜约束下计算相位质量图，用于评估相位的可靠性
+    只在掩膜区域内进行计算，掩膜外区域设为0
+    
+    参数:
+        images: 相移图像列表
+        mask: 投影区域掩膜，True表示需要计算的区域
+    
+    返回:
+        quality_map: 相位质量图，掩膜外区域为0
+    """
+    # 确保掩膜是布尔类型
+    mask = mask.astype(bool)
+    
+    # 创建掩膜约束的图像
+    masked_images = []
+    for img in images:
+        masked_img = img.copy().astype(np.float32)
+        masked_img[~mask] = 0  # 掩膜外区域设为0
+        masked_images.append(masked_img)
+    
+    # 计算强度调制
+    n = len(masked_images)
+    
+    # 计算平均强度
+    avg_intensity = sum(masked_images) / n
+    
+    # 计算相移步长
+    delta = 2 * np.pi / n
+    
+    # 计算正弦和余弦分量
+    sin_sum = 0
+    cos_sum = 0
+    
+    for i in range(n):
+        phase_shift = i * delta
+        sin_sum += masked_images[i] * np.sin(phase_shift)
+        cos_sum += masked_images[i] * np.cos(phase_shift)
+    
+    # 计算调制幅度
+    modulation = np.sqrt(sin_sum**2 + cos_sum**2) * (2 / n)
+    
+    # 计算质量图 (调制幅度除以平均强度，避免除零)
+    eps = 1e-10  # 小值防止除零
+    quality_map = modulation / (avg_intensity + eps)
+    
+    # 确保掩膜外区域为0
+    quality_map[~mask] = 0
+    
+    return quality_map
+
+
 def generate_projection_mask(images: List[np.ndarray], 
                              algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
-                             method: str = 'otsu', 
+                             method: str = 'adaptive', 
                              thresh_rel: Optional[float] = None, 
                              min_area: int = 500,
                              confidence: float = 0.5,
                              border_trim_px: int = 10) -> np.ndarray:
     """
     基于相移图像生成投影区域掩膜（True为有效投影区域），支持置信度调节。
-    参考 unwrap_phase.generate_projection_mask 的实现，使掩膜对投影区域更鲁棒。
+    改进版本：增加了自适应阈值化、噪声抑制、智能边界处理等功能
+    
+    参数:
+        images: 相移图像列表
+        algorithm: 相移算法类型
+        method: 阈值化方法 ('otsu', 'relative', 'adaptive')
+        thresh_rel: 相对阈值（仅用于relative方法）
+        min_area: 最小连通区域面积
+        confidence: 掩膜置信度阈值 (0.1-0.9)，控制掩膜的严格程度
+        border_trim_px: 边界收缩像素数
+    
+    返回:
+        mask: 二值掩膜，True表示投影区域
     """
+    if len(images) < 3:
+        raise ValueError(f"至少需要3张图像，但只提供了{len(images)}张")
+    
+    # 计算基础特征
     imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
     I_max = np.max(imgs, axis=2)
     I_min = np.min(imgs, axis=2)
     I_mean = np.mean(imgs, axis=2)
+    I_std = np.std(imgs, axis=2)
 
-    A = (I_max - I_min) / 2.0
-    M = (I_max - I_min) / (I_max + I_min + 1e-9)
-
+    # 基本特征计算
+    A = (I_max - I_min) / 2.0  # 振幅
+    M = (I_max - I_min) / (I_max + I_min + 1e-9)  # 调制度
+    
+    # 新增特征：相位稳定性（基于标准差）
+    S = I_std / (I_mean + 1e-9)  # 归一化标准差，反映相位稳定性
+    
+    # 噪声检测和抑制
+    A, M, S = apply_noise_reduction_calibration(A, M, S, I_mean)
+    
+    # 归一化特征
     A_norm = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     M_norm = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    S_norm = cv2.normalize(S, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     I_norm = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    if method == 'otsu':
-        _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        th_I = np.percentile(I_norm, 50)
-        mask_I = (I_norm > th_I).astype(np.uint8) * 255
-        mask = np.logical_or(mask_A > 0, mask_M > 0)
-        mask = np.logical_and(mask, mask_I > 0)
+    
+    # 选择阈值化方法
+    if method == 'adaptive':
+        mask = adaptive_thresholding_calibration(A_norm, M_norm, S_norm, I_norm, confidence)
+    elif method == 'otsu':
+        mask = otsu_thresholding_calibration(A_norm, M_norm, I_norm)
     elif method == 'relative':
-        if thresh_rel is None:
-            thresh_rel = 0.2
-        adjusted_thresh_rel = float(thresh_rel) * (2 - float(confidence))
-        th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
-        th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
-        th_I = np.percentile(I_norm, 50)
-        mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
-        mask = np.logical_and(mask, I_norm > th_I)
+        mask = relative_thresholding_calibration(A_norm, M_norm, I_norm, thresh_rel, confidence)
     else:
         raise ValueError(f"不支持的阈值化方法: {method}")
-
-    # 形态学清理
-    mask = morphology.binary_closing(mask, morphology.disk(7))
-    mask = morphology.remove_small_objects(mask, min_size=min_area)
-    mask = morphology.remove_small_holes(mask, area_threshold=min_area)
-    mask = mask.astype(np.uint8)
-
-    # 边界收缩，避免边界伪影
-    if border_trim_px and border_trim_px > 0:
-        h, w = mask.shape
-        bt = min(border_trim_px, min(h // 10, w // 10))
-        if bt > 0:
-            mask[:bt, :] = 0
-            mask[-bt:, :] = 0
-            mask[:, :bt] = 0
-            mask[:, -bt:] = 0
-
-    # 轻微膨胀回收边缘
-    mask = cv2.dilate(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5)))
-
-    # 保留最大连通分量
-    num_labels, labels = cv2.connectedComponents(mask)
-    if num_labels > 1:
-        areas = [(labels == i).sum() for i in range(1, num_labels)]
-        if len(areas) > 0:
-            keep = int(np.argmax(areas)) + 1
-            mask = (labels == keep).astype(np.uint8)
-
+    
+    print(f"掩膜生成参数: 方法={method}, 置信度={confidence:.2f}")
+    
+    # 渐进式形态学处理
+    mask = progressive_morphological_processing_calibration(mask, min_area)
+    
+    # 智能边界处理
+    mask = smart_border_trimming_calibration(mask, border_trim_px)
+    
+    # 连通性分析和优化
+    mask = connectivity_optimization_calibration(mask)
+    
     return mask.astype(bool)
+
+
+def apply_noise_reduction_calibration(A, M, S, I_mean):
+    """应用噪声抑制 - 投影仪标定版本"""
+    # 使用高斯滤波减少噪声
+    A_filtered = cv2.GaussianBlur(A, (5, 5), 1.0)
+    M_filtered = cv2.GaussianBlur(M, (5, 5), 1.0)
+    S_filtered = cv2.GaussianBlur(S, (5, 5), 1.0)
+    
+    # 检测异常高的噪声区域
+    noise_mask = (S > np.percentile(S, 95)) & (I_mean < np.percentile(I_mean, 20))
+    
+    # 在噪声区域使用滤波后的值
+    A = np.where(noise_mask, A_filtered, A)
+    M = np.where(noise_mask, M_filtered, M)
+    S = np.where(noise_mask, S_filtered, S)
+    
+    return A, M, S
+
+
+def adaptive_thresholding_calibration(A_norm, M_norm, S_norm, I_norm, confidence):
+    """自适应阈值化方法 - 投影仪标定版本"""
+    # 计算每个特征的多级阈值
+    th_A_low = np.percentile(A_norm[A_norm > 0], 30)
+    th_A_high = np.percentile(A_norm[A_norm > 0], 70)
+    
+    th_M_low = np.percentile(M_norm[M_norm > 0], 30)
+    th_M_high = np.percentile(M_norm[M_norm > 0], 70)
+    
+    th_I = np.percentile(I_norm, 50)
+    
+    # 稳定性阈值（高稳定性意味着低标准差）
+    th_S = np.percentile(S_norm, 60)
+    
+    # 多级判断
+    # 高置信度区域：振幅和调制度都高
+    high_confidence = (A_norm >= th_A_high) & (M_norm >= th_M_high) & (S_norm <= th_S)
+    
+    # 中等置信度区域：振幅或调制度高
+    medium_confidence = ((A_norm >= th_A_low) | (M_norm >= th_M_low)) & (S_norm <= th_S)
+    
+    # 强度约束
+    intensity_valid = I_norm > th_I
+    
+    # 根据置信度参数选择区域
+    if confidence >= 0.7:
+        mask = high_confidence & intensity_valid
+    elif confidence >= 0.4:
+        mask = (high_confidence | medium_confidence) & intensity_valid
+    else:
+        mask = medium_confidence & intensity_valid
+    
+    return mask
+
+
+def otsu_thresholding_calibration(A_norm, M_norm, I_norm):
+    """改进的Otsu方法 - 投影仪标定版本"""
+    _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    th_I = np.percentile(I_norm, 50)
+    mask_I = (I_norm > th_I).astype(np.uint8) * 255
+    
+    mask = np.logical_or(mask_A > 0, mask_M > 0)
+    mask = np.logical_and(mask, mask_I > 0)
+    
+    return mask
+
+
+def relative_thresholding_calibration(A_norm, M_norm, I_norm, thresh_rel, confidence):
+    """改进的相对阈值方法 - 投影仪标定版本"""
+    if thresh_rel is None:
+        thresh_rel = 0.2
+    
+    adjusted_thresh_rel = float(thresh_rel) * (2 - float(confidence))
+    th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
+    th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
+    th_I = np.percentile(I_norm, 50)
+    
+    mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
+    mask = np.logical_and(mask, I_norm > th_I)
+    
+    return mask
+
+
+def progressive_morphological_processing_calibration(mask, min_area):
+    """渐进式形态学处理 - 投影仪标定版本"""
+    mask = mask.astype(np.uint8)
+    
+    # 小尺度闭运算
+    mask = morphology.binary_closing(mask, morphology.disk(3))
+    
+    # 移除小对象
+    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//4)
+    
+    # 中等尺度闭运算
+    mask = morphology.binary_closing(mask, morphology.disk(5))
+    
+    # 填充小孔洞
+    mask = morphology.remove_small_holes(mask, area_threshold=min_area//2)
+    
+    # 最终移除小对象
+    mask = morphology.remove_small_objects(mask, min_size=min_area)
+    
+    return mask.astype(np.uint8)
+
+
+def smart_border_trimming_calibration(mask, border_trim_px):
+    """智能边界处理 - 投影仪标定版本"""
+    if not border_trim_px or border_trim_px <= 0:
+        return mask
+    
+    h, w = mask.shape
+    bt = min(border_trim_px, min(h // 15, w // 15))  # 更保守的边界收缩
+    
+    if bt > 0:
+        # 只在边界区域确实存在噪声时才进行收缩
+        border_noise_ratio = 0.1  # 边界噪声比例阈值
+        
+        # 检查上下边界
+        top_ratio = np.mean(mask[:bt, :])
+        bottom_ratio = np.mean(mask[-bt:, :])
+        left_ratio = np.mean(mask[:, :bt])
+        right_ratio = np.mean(mask[:, -bt:])
+        
+        if top_ratio < border_noise_ratio:
+            mask[:bt, :] = 0
+        if bottom_ratio < border_noise_ratio:
+            mask[-bt:, :] = 0
+        if left_ratio < border_noise_ratio:
+            mask[:, :bt] = 0
+        if right_ratio < border_noise_ratio:
+            mask[:, -bt:] = 0
+    
+    return mask
+
+
+def connectivity_optimization_calibration(mask):
+    """连通性优化 - 投影仪标定版本"""
+    # 保留最大的几个连通分量
+    num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    
+    if num_labels <= 2:  # 背景 + 1个前景
+        return mask
+    
+    # 计算每个连通分量的面积
+    areas = [(labels == i).sum() for i in range(1, num_labels)]
+    
+    if len(areas) == 0:
+        return mask
+    
+    # 保留最大的连通分量，以及面积超过最大面积30%的其他分量
+    max_area = max(areas)
+    area_threshold = max_area * 0.3
+    
+    new_mask = np.zeros_like(mask)
+    for i, area in enumerate(areas):
+        if area >= area_threshold:
+            new_mask[labels == (i + 1)] = 1
+    
+    return new_mask.astype(np.uint8)
 
 
 def compute_phase_quality(images: List[np.ndarray]) -> np.ndarray:
@@ -436,13 +714,9 @@ def process_four_step_images_integrated(image_paths: List[str], output_dir: str,
     mask = generate_projection_mask(images, PhaseShiftingAlgorithm.four_step, method=mask_method, min_area=min_area, confidence=mask_confidence)
     cv2.imwrite(os.path.join(output_dir, "projection_mask.png"), (mask.astype(np.uint8) * 255))
 
-    # 计算包裹相位与质量图
-    wrapped_phase = compute_wrapped_phase(images, PhaseShiftingAlgorithm.four_step)
-    quality_map = compute_phase_quality(images)
-
-    # 掩膜约束：掩膜外置零
-    wrapped_phase[~mask] = 0
-    quality_map[~mask] = 0
+    # 使用掩膜约束计算包裹相位与质量图
+    wrapped_phase, _ = compute_phasor_and_phase_masked(images, mask, PhaseShiftingAlgorithm.four_step)
+    quality_map = compute_phase_quality_masked(images, mask)
     
     visualize_phase(wrapped_phase, "Wrapped Phase", os.path.join(output_dir, "wrapped_phase.png"), 
                     show_plots, True, quality_map)
@@ -1033,11 +1307,13 @@ def detect_calibration_board(image, board_type, chessboard_size, square_size):
             
     return None, None
 
-# 使用向量化操作提取相位对应关系
+# 使用向量化操作提取相位对应关系 - 改进版本，支持掩码约束
 def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped, 
-                              projector_width, projector_height, sampling_step=5):
+                              projector_width, projector_height, sampling_step=5, 
+                              mask=None):
     """
     从水平和垂直方向的解包裹相位中提取投影仪-相机像素对应关系，使用向量化操作提高性能
+    改进版本：支持掩码约束，只在投影区域内建立对应关系
     
     参数:
         horizontal_unwrapped: 水平方向解包裹相位图
@@ -1045,6 +1321,7 @@ def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped,
         projector_width: 投影仪宽度
         projector_height: 投影仪高度
         sampling_step: 采样步长，减少点数提高性能
+        mask: 投影区域掩膜，True表示有效投影区域（可选）
         
     返回:
         correspondences: 投影仪点和相机点的对应关系字典
@@ -1055,12 +1332,25 @@ def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped,
     # 获取相位图尺寸
     height, width = horizontal_unwrapped.shape if horizontal_unwrapped is not None else vertical_unwrapped.shape
     
+    # 如果没有提供掩膜，创建一个基于相位值的简单掩膜
+    if mask is None:
+        if horizontal_unwrapped is not None and vertical_unwrapped is not None:
+            mask = (horizontal_unwrapped > 0) & (vertical_unwrapped > 0)
+        elif horizontal_unwrapped is not None:
+            mask = horizontal_unwrapped > 0
+        else:
+            mask = vertical_unwrapped > 0
+        print("警告：未提供掩膜，使用基于相位值的简单掩膜")
+    else:
+        mask = mask.astype(bool)
+        print(f"使用提供的掩膜，有效像素数: {np.sum(mask)}")
+    
     # 创建结果字典
     correspondences = {}
     
     # 使用进度条来显示处理进度
     if TQDM_AVAILABLE:
-        print("提取相位对应关系...")
+        print("提取相位对应关系（掩膜约束）...")
     
     if horizontal_unwrapped is not None and vertical_unwrapped is not None:
         # 两个方向都有相位信息，使用向量化操作
@@ -1074,12 +1364,15 @@ def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped,
         h_phases = horizontal_unwrapped[y_coords, x_coords]
         v_phases = vertical_unwrapped[y_coords, x_coords]
         
-        # 获取相位图的最大值
-        h_max_phase = np.max(horizontal_unwrapped[horizontal_unwrapped > 0])
-        v_max_phase = np.max(vertical_unwrapped[vertical_unwrapped > 0])
+        # 获取掩膜状态
+        mask_values = mask[y_coords, x_coords]
         
-        # 查找有效点（两个方向都有有效相位值）
-        valid_mask = (h_phases > 0) & (v_phases > 0)
+        # 获取相位图的最大值（只在掩膜区域内计算）
+        h_max_phase = np.max(horizontal_unwrapped[mask]) if np.any(mask) else 1.0
+        v_max_phase = np.max(vertical_unwrapped[mask]) if np.any(mask) else 1.0
+        
+        # 查找有效点（必须在掩膜内且两个方向都有有效相位值）
+        valid_mask = mask_values & (h_phases > 0) & (v_phases > 0)
         
         # 计算有效点的投影仪坐标
         if np.any(valid_mask):
@@ -1107,9 +1400,11 @@ def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped,
         x_coords = x_coords.flatten()
         
         h_phases = horizontal_unwrapped[y_coords, x_coords]
-        h_max_phase = np.max(horizontal_unwrapped[horizontal_unwrapped > 0])
+        mask_values = mask[y_coords, x_coords]
+        h_max_phase = np.max(horizontal_unwrapped[mask]) if np.any(mask) else 1.0
         
-        valid_mask = h_phases > 0
+        # 必须在掩膜内且有有效相位值
+        valid_mask = mask_values & (h_phases > 0)
         if np.any(valid_mask):
             valid_y_coords = y_coords[valid_mask]
             valid_x_coords = x_coords[valid_mask]
@@ -1134,9 +1429,11 @@ def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped,
         x_coords = x_coords.flatten()
         
         v_phases = vertical_unwrapped[y_coords, x_coords]
-        v_max_phase = np.max(vertical_unwrapped[vertical_unwrapped > 0])
+        mask_values = mask[y_coords, x_coords]
+        v_max_phase = np.max(vertical_unwrapped[mask]) if np.any(mask) else 1.0
         
-        valid_mask = v_phases > 0
+        # 必须在掩膜内且有有效相位值
+        valid_mask = mask_values & (v_phases > 0)
         if np.any(valid_mask):
             valid_y_coords = y_coords[valid_mask]
             valid_x_coords = x_coords[valid_mask]
@@ -1154,7 +1451,12 @@ def extract_phase_correspondence(horizontal_unwrapped, vertical_unwrapped,
             for y, x, proj_x, proj_y in items:
                 correspondences[(y, x)] = (proj_x, proj_y)
     
-    print(f"从相位图中提取了 {len(correspondences)} 个像素对应关系")
+    print(f"从相位图中提取了 {len(correspondences)} 个像素对应关系（掩膜约束）")
+    if mask is not None:
+        total_mask_pixels = np.sum(mask)
+        sampled_mask_pixels = total_mask_pixels // (sampling_step * sampling_step)
+        coverage_ratio = len(correspondences) / max(sampled_mask_pixels, 1) * 100
+        print(f"掩膜覆盖率: {coverage_ratio:.1f}% ({len(correspondences)}/{sampled_mask_pixels})")
     return correspondences
 
 # 在process_phase_images函数中添加相位质量评估和优化
@@ -1624,11 +1926,9 @@ def process_n_step_images_integrated(image_paths: List[str], output_dir: str,
     cv2.imwrite(os.path.join(output_dir, "Modulation.png"), cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
     cv2.imwrite(os.path.join(output_dir, "MeanIntensity.png"), cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
 
-    # 计算包裹相位与质量图，并在掩膜外置零
-    wrapped_phase = compute_wrapped_phase(images, PhaseShiftingAlgorithm.n_step)
-    quality_map = compute_phase_quality(images)
-    wrapped_phase[~mask] = 0
-    quality_map[~mask] = 0
+    # 使用掩膜约束计算包裹相位与质量图
+    wrapped_phase, _ = compute_phasor_and_phase_masked(images, mask, PhaseShiftingAlgorithm.n_step)
+    quality_map = compute_phase_quality_masked(images, mask)
     
     visualize_phase(wrapped_phase, "Wrapped Phase", os.path.join(output_dir, "wrapped_phase.png"), 
                     show_plots, True, quality_map)
@@ -1771,6 +2071,21 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
                 v_paths, v_output_dir, show_plots=visualize, return_quality=True,
                 mask_method=mask_method, mask_confidence=mask_confidence
             )
+            
+            # 生成组合掩膜（水平和垂直相位的交集）
+            print_func("  - 生成投影区域掩膜...")
+            # 读取水平和垂直方向的掩膜
+            h_mask_path = os.path.join(h_output_dir, "projection_mask.png")
+            v_mask_path = os.path.join(v_output_dir, "projection_mask.png")
+            
+            combined_mask = None
+            if os.path.exists(h_mask_path) and os.path.exists(v_mask_path):
+                h_mask = cv2.imread(h_mask_path, cv2.IMREAD_GRAYSCALE) > 0
+                v_mask = cv2.imread(v_mask_path, cv2.IMREAD_GRAYSCALE) > 0
+                combined_mask = h_mask & v_mask  # 取交集
+                print_func(f"  - 组合掩膜有效像素: {np.sum(combined_mask)}")
+            else:
+                print_func("  - 警告: 无法读取掩膜文件，将使用相位值判断有效区域")
 
             # 过滤低质量相位点
             if adaptive_threshold:
@@ -1804,19 +2119,30 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
 
             print_func(f"  - 成功检测到 {len(cam_points_pose)} 个角点。")
 
-            # 提取投影仪中的对应点
+            # 提取投影仪中的对应点（掩膜约束）
             proj_points_pose = []
             for point in cam_points_pose:
                 x, y = point[0]
-                phi_h = bilinear_interpolate(h_unwrapped, y, x)
-                phi_v = bilinear_interpolate(v_unwrapped, y, x)
                 
-                # 检查插值后的相位是否有效
-                if phi_h != 0 and phi_v != 0:
-                    # 相位值到投影仪像素坐标的映射 (使用动态范围)
-                    px = (phi_h - h_min) / (h_max - h_min) * (projector_width - 1)
-                    py = (phi_v - v_min) / (v_max - v_min) * (projector_height - 1)
-                    proj_points_pose.append([px, py])
+                # 首先检查角点是否在掩膜有效区域内
+                is_in_mask = True
+                if combined_mask is not None:
+                    # 检查角点位置是否在掩膜内
+                    if 0 <= int(y) < combined_mask.shape[0] and 0 <= int(x) < combined_mask.shape[1]:
+                        is_in_mask = combined_mask[int(y), int(x)]
+                    else:
+                        is_in_mask = False
+                
+                if is_in_mask:
+                    phi_h = bilinear_interpolate(h_unwrapped, y, x)
+                    phi_v = bilinear_interpolate(v_unwrapped, y, x)
+                    
+                    # 检查插值后的相位是否有效（掩膜约束下的双重检查）
+                    if phi_h != 0 and phi_v != 0:
+                        # 相位值到投影仪像素坐标的映射 (使用动态范围)
+                        px = (phi_h - h_min) / (h_max - h_min) * (projector_width - 1)
+                        py = (phi_v - v_min) / (v_max - v_min) * (projector_height - 1)
+                        proj_points_pose.append([px, py])
             
             if len(proj_points_pose) < len(cam_points_pose) * 0.8:
                 print_func(f"  - 警告: {len(cam_points_pose) - len(proj_points_pose)} 个角点位于无效相位区域，已被丢弃。")
@@ -1826,10 +2152,25 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
 
             proj_points_pose = np.array(proj_points_pose, dtype=np.float32).reshape(-1, 1, 2)
             
-            # 由于部分角点可能被丢弃，需要筛选对应的相机点和物体点
-            valid_indices = [i for i, point in enumerate(cam_points_pose) 
-                             if bilinear_interpolate(h_unwrapped, point[0][1], point[0][0]) != 0 and 
-                                bilinear_interpolate(v_unwrapped, point[0][1], point[0][0]) != 0]
+            # 由于部分角点可能被丢弃，需要筛选对应的相机点和物体点（掩膜约束）
+            valid_indices = []
+            for i, point in enumerate(cam_points_pose):
+                x, y = point[0]
+                
+                # 检查是否在掩膜内
+                is_in_mask = True
+                if combined_mask is not None:
+                    if 0 <= int(y) < combined_mask.shape[0] and 0 <= int(x) < combined_mask.shape[1]:
+                        is_in_mask = combined_mask[int(y), int(x)]
+                    else:
+                        is_in_mask = False
+                
+                # 检查相位值是否有效
+                if is_in_mask:
+                    phi_h = bilinear_interpolate(h_unwrapped, y, x)
+                    phi_v = bilinear_interpolate(v_unwrapped, y, x)
+                    if phi_h != 0 and phi_v != 0:
+                        valid_indices.append(i)
 
             if len(valid_indices) != len(proj_points_pose):
                  # 这是一个内部逻辑检查，正常不应触发

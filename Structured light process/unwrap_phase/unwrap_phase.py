@@ -187,95 +187,251 @@ def compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShif
 
 def generate_projection_mask(images: List[np.ndarray], 
                            algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
-                          method: str = 'otsu', 
+                          method: str = 'adaptive', 
                            thresh_rel: Optional[float] = None, 
                            min_area: int = 500,
                            confidence: float = 0.5,
                            border_trim_px: int = 10) -> np.ndarray:
     """
     基于相移图像生成投影区域掩膜，用于区分投影区域和背景
+    改进版本：增加了自适应阈值化、噪声抑制、智能边界处理等功能
     
     参数:
         images: 相移图像列表
         algorithm: 相移算法类型
-        method: 阈值化方法 ('otsu', 'relative')
+        method: 阈值化方法 ('otsu', 'relative', 'adaptive')
         thresh_rel: 相对阈值（仅用于relative方法）
         min_area: 最小连通区域面积
         confidence: 掩膜置信度阈值 (0.1-0.9)，控制掩膜的严格程度
+        border_trim_px: 边界收缩像素数
     
     返回:
         mask: 二值掩膜，True表示投影区域
     """
-    # 与 test.py 对齐：
-    # 计算四步（或N步）图像的 I_max, I_min, I_mean
+    if len(images) < 3:
+        raise ValueError(f"至少需要3张图像，但只提供了{len(images)}张")
+    
+    # 计算基础特征
     imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
     I_max = np.max(imgs, axis=2)
     I_min = np.min(imgs, axis=2)
     I_mean = np.mean(imgs, axis=2)
+    I_std = np.std(imgs, axis=2)
 
-    # 振幅 A, 调制度 M, 平均亮度 I_mean
-    A = (I_max - I_min) / 2.0
-    M = (I_max - I_min) / (I_max + I_min + 1e-9)
-
-    # 归一化到0-255范围
+    # 基本特征计算
+    A = (I_max - I_min) / 2.0  # 振幅
+    M = (I_max - I_min) / (I_max + I_min + 1e-9)  # 调制度
+    
+    # 新增特征：相位稳定性（基于标准差）
+    S = I_std / (I_mean + 1e-9)  # 归一化标准差，反映相位稳定性
+    
+    # 噪声检测和抑制
+    A, M, S = _apply_noise_reduction(A, M, S, I_mean)
+    
+    # 归一化特征
     A_norm = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     M_norm = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    S_norm = cv2.normalize(S, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     I_norm = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    # 根据选择的方法进行阈值化，并应用置信度调节
-    if method == 'otsu':
-        # test.py 逻辑：Otsu 分别对 A 和 M，二者取 OR；再与亮度阈值 AND
-        _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # 亮度阈值：> 50 分位
-        th_I = np.percentile(I_norm, 50)
-        mask_I = (I_norm > th_I).astype(np.uint8) * 255
-        mask = np.logical_or(mask_A > 0, mask_M > 0)
-        mask = np.logical_and(mask, mask_I > 0)
+    # 选择阈值化方法
+    if method == 'adaptive':
+        mask = _adaptive_thresholding(A_norm, M_norm, S_norm, I_norm, confidence)
+    elif method == 'otsu':
+        mask = _otsu_thresholding(A_norm, M_norm, I_norm)
     elif method == 'relative':
-        # 相对百分位阈值：使用置信度调节保留比例
-        if thresh_rel is None: 
-            thresh_rel = 0.2
-        # 置信度越高，保留的像素比例越少（更严格）
-        adjusted_thresh_rel = thresh_rel * (2 - confidence)
-        th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
-        th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
-        th_I = np.percentile(I_norm, 50)
-        mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
-        mask = np.logical_and(mask, I_norm > th_I)
+        mask = _relative_thresholding(A_norm, M_norm, I_norm, thresh_rel, confidence)
     else:
         raise ValueError(f"不支持的阈值化方法: {method}")
     
     print(f"掩膜生成参数: 方法={method}, 置信度={confidence:.2f}")
     
-    # 形态学清理（与 test.py 一致）
-    mask = morphology.binary_closing(mask, morphology.disk(7))
-    mask = morphology.remove_small_objects(mask, min_size=min_area)
-    mask = morphology.remove_small_holes(mask, area_threshold=min_area)
-    mask = mask.astype(np.uint8)
-
-    # 去除图像四周若干像素，避免投影条纹在边界处产生的锯齿伪影
-    if border_trim_px and border_trim_px > 0:
-        h, w = mask.shape
-        bt = min(border_trim_px, min(h // 10, w // 10))
-        if bt > 0:
-            mask[:bt, :] = 0
-            mask[-bt:, :] = 0
-            mask[:, :bt] = 0
-            mask[:, -bt:] = 0
-
-    # 轻微膨胀回收边缘（与 test.py 一致）
-    mask = cv2.dilate(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5)))
+    # 渐进式形态学处理
+    mask = _progressive_morphological_processing(mask, min_area)
     
-    # 保留最大连通分量（可选）
-    num_labels, labels = cv2.connectedComponents(mask)
-    if num_labels > 1:
-        areas = [(labels == i).sum() for i in range(1, num_labels)]
-        if len(areas) > 0:
-            keep = np.argmax(areas) + 1
-            mask = (labels == keep).astype(np.uint8)
+    # 智能边界处理
+    mask = _smart_border_trimming(mask, border_trim_px)
+    
+    # 连通性分析和优化
+    mask = _connectivity_optimization(mask)
     
     return mask.astype(bool)
+
+
+def _apply_noise_reduction(A, M, S, I_mean):
+    """应用噪声抑制"""
+    # 使用高斯滤波减少噪声
+    A_filtered = cv2.GaussianBlur(A, (5, 5), 1.0)
+    M_filtered = cv2.GaussianBlur(M, (5, 5), 1.0)
+    S_filtered = cv2.GaussianBlur(S, (5, 5), 1.0)
+    
+    # 检测异常高的噪声区域
+    noise_mask = (S > np.percentile(S, 95)) & (I_mean < np.percentile(I_mean, 20))
+    
+    # 在噪声区域使用滤波后的值
+    A = np.where(noise_mask, A_filtered, A)
+    M = np.where(noise_mask, M_filtered, M)
+    S = np.where(noise_mask, S_filtered, S)
+    
+    return A, M, S
+
+
+def _adaptive_thresholding(A_norm, M_norm, S_norm, I_norm, confidence):
+    """自适应阈值化方法"""
+    # 计算每个特征的多级阈值
+    th_A_low = np.percentile(A_norm[A_norm > 0], 25)  # 降低阈值
+    th_A_high = np.percentile(A_norm[A_norm > 0], 60) # 降低阈值
+    
+    th_M_low = np.percentile(M_norm[M_norm > 0], 25)  # 降低阈值
+    th_M_high = np.percentile(M_norm[M_norm > 0], 60) # 降低阈值
+    
+    th_I = np.percentile(I_norm, 40)  # 降低强度阈值
+    
+    # 稳定性阈值（修复：使用更宽松的稳定性约束）
+    th_S = np.percentile(S_norm, 75)  # 提高阈值，允许更多区域通过
+    
+    # 多级判断（修复：移除过于严格的稳定性约束）
+    # 高置信度区域：振幅和调制度都高，稳定性约束更宽松
+    high_confidence = (A_norm >= th_A_high) & (M_norm >= th_M_high)
+    
+    # 中等置信度区域：振幅或调制度高，加入稳定性约束但更宽松
+    medium_confidence = ((A_norm >= th_A_low) | (M_norm >= th_M_low)) & (S_norm <= th_S)
+    
+    # 低置信度区域：仅基于振幅或调制度
+    low_confidence = (A_norm >= th_A_low) | (M_norm >= th_M_low)
+    
+    # 强度约束
+    intensity_valid = I_norm > th_I
+    
+    # 根据置信度参数选择区域（修复：简化逻辑，主要基于振幅和调制度）
+    if confidence >= 0.8:
+        # 最严格：只要高振幅和高调制度
+        mask = high_confidence & intensity_valid
+    elif confidence >= 0.6:
+        # 严格：高置信度区域为主
+        mask = high_confidence & intensity_valid
+    elif confidence >= 0.4:
+        # 中等：高置信度区域 + 部分中等置信度区域
+        mask = (high_confidence | (medium_confidence & (A_norm >= th_A_high * 0.8))) & intensity_valid
+    elif confidence >= 0.2:
+        # 宽松：包含更多中等置信度区域
+        mask = (high_confidence | medium_confidence) & intensity_valid
+    else:
+        # 最宽松：主要基于振幅和调制度，忽略稳定性
+        mask = low_confidence & intensity_valid
+    
+    return mask
+
+
+def _otsu_thresholding(A_norm, M_norm, I_norm):
+    """改进的Otsu方法"""
+    _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 降低强度阈值，使更多区域通过
+    th_I = np.percentile(I_norm, 30)  # 从50降低到30
+    mask_I = (I_norm > th_I).astype(np.uint8) * 255
+    
+    mask = np.logical_or(mask_A > 0, mask_M > 0)
+    mask = np.logical_and(mask, mask_I > 0)
+    
+    return mask
+
+
+def _relative_thresholding(A_norm, M_norm, I_norm, thresh_rel, confidence):
+    """改进的相对阈值方法"""
+    if thresh_rel is None:
+        thresh_rel = 0.3  # 提高默认阈值，使掩码更宽松
+    
+    # 调整相对阈值计算，使其更宽松
+    adjusted_thresh_rel = float(thresh_rel) * (2.5 - float(confidence))  # 增加系数
+    th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
+    th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
+    th_I = np.percentile(I_norm, 30)  # 降低强度阈值
+    
+    mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
+    mask = np.logical_and(mask, I_norm > th_I)
+    
+    return mask
+
+
+def _progressive_morphological_processing(mask, min_area):
+    """渐进式形态学处理"""
+    mask = mask.astype(np.uint8)
+    
+    # 更温和的形态学处理
+    # 小尺度闭运算
+    mask = morphology.binary_closing(mask, morphology.disk(2))  # 减小核大小
+    
+    # 移除超小对象（更宽松）
+    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//8)  # 更小的阈值
+    
+    # 中等尺度闭运算
+    mask = morphology.binary_closing(mask, morphology.disk(3))  # 减小核大小
+    
+    # 填充小孔洞（更宽松）
+    mask = morphology.remove_small_holes(mask, area_threshold=min_area//4)  # 更小的阈值
+    
+    # 最终移除小对象（更宽松）
+    mask = morphology.remove_small_objects(mask, min_size=min_area//2)  # 更小的阈值
+    
+    return mask.astype(np.uint8)
+
+
+def _smart_border_trimming(mask, border_trim_px):
+    """智能边界处理"""
+    if not border_trim_px or border_trim_px <= 0:
+        return mask
+    
+    h, w = mask.shape
+    bt = min(border_trim_px, min(h // 15, w // 15))  # 更保守的边界收缩
+    
+    if bt > 0:
+        # 只在边界区域确实存在噪声时才进行收缩
+        border_noise_ratio = 0.1  # 边界噪声比例阈值
+        
+        # 检查上下边界
+        top_ratio = np.mean(mask[:bt, :])
+        bottom_ratio = np.mean(mask[-bt:, :])
+        left_ratio = np.mean(mask[:, :bt])
+        right_ratio = np.mean(mask[:, -bt:])
+        
+        if top_ratio < border_noise_ratio:
+            mask[:bt, :] = 0
+        if bottom_ratio < border_noise_ratio:
+            mask[-bt:, :] = 0
+        if left_ratio < border_noise_ratio:
+            mask[:, :bt] = 0
+        if right_ratio < border_noise_ratio:
+            mask[:, -bt:] = 0
+    
+    return mask
+
+
+def _connectivity_optimization(mask):
+    """连通性优化"""
+    # 保留最大的几个连通分量
+    num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    
+    if num_labels <= 2:  # 背景 + 1个前景
+        return mask
+    
+    # 计算每个连通分量的面积
+    areas = [(labels == i).sum() for i in range(1, num_labels)]
+    
+    if len(areas) == 0:
+        return mask
+    
+    # 保留最大的连通分量，以及面积超过最大面积30%的其他分量
+    max_area = max(areas)
+    area_threshold = max_area * 0.3
+    
+    new_mask = np.zeros_like(mask)
+    for i, area in enumerate(areas):
+        if area >= area_threshold:
+            new_mask[labels == (i + 1)] = 1
+    
+    return new_mask.astype(np.uint8)
 
 
 def compute_phase_quality_masked(images: List[np.ndarray], mask: np.ndarray) -> np.ndarray:
