@@ -831,7 +831,14 @@ class CameraCalibrationWindow(QMainWindow):
             dist_coeffs = self.calibration_result['dist_coeffs']
             
             # 读取原始图像
-            original_img = cv2.imread(file_path)
+            original_img = cv2.imread(file_path, cv2.IMREAD_COLOR)
+            if original_img is None:
+                # 如果彩色模式失败，尝试以灰度模式读取
+                original_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+                if original_img is not None:
+                    # 将灰度图像转换为3通道以保持一致性
+                    original_img = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
+            
             if original_img is None:
                 raise ValueError(f"无法读取图像: {file_path}")
                 

@@ -380,46 +380,59 @@ def apply_noise_reduction_calibration(A, M, S, I_mean):
 
 
 def adaptive_thresholding_calibration(A_norm, M_norm, S_norm, I_norm, confidence):
-    """自适应阈值化方法 - 投影仪标定版本"""
+    """自适应阈值化方法 - 改进版本（基于unwrap_phase.py）"""
     # 计算每个特征的多级阈值
-    th_A_low = np.percentile(A_norm[A_norm > 0], 30)
-    th_A_high = np.percentile(A_norm[A_norm > 0], 70)
+    th_A_low = np.percentile(A_norm[A_norm > 0], 25)  # 降低阈值
+    th_A_high = np.percentile(A_norm[A_norm > 0], 60) # 降低阈值
     
-    th_M_low = np.percentile(M_norm[M_norm > 0], 30)
-    th_M_high = np.percentile(M_norm[M_norm > 0], 70)
+    th_M_low = np.percentile(M_norm[M_norm > 0], 25)  # 降低阈值
+    th_M_high = np.percentile(M_norm[M_norm > 0], 60) # 降低阈值
     
-    th_I = np.percentile(I_norm, 50)
+    th_I = np.percentile(I_norm, 40)  # 降低强度阈值
     
-    # 稳定性阈值（高稳定性意味着低标准差）
-    th_S = np.percentile(S_norm, 60)
+    # 稳定性阈值（修复：使用更宽松的稳定性约束）
+    th_S = np.percentile(S_norm, 75)  # 提高阈值，允许更多区域通过
     
-    # 多级判断
-    # 高置信度区域：振幅和调制度都高
-    high_confidence = (A_norm >= th_A_high) & (M_norm >= th_M_high) & (S_norm <= th_S)
+    # 多级判断（修复：移除过于严格的稳定性约束）
+    # 高置信度区域：振幅和调制度都高，稳定性约束更宽松
+    high_confidence = (A_norm >= th_A_high) & (M_norm >= th_M_high)
     
-    # 中等置信度区域：振幅或调制度高
+    # 中等置信度区域：振幅或调制度高，加入稳定性约束但更宽松
     medium_confidence = ((A_norm >= th_A_low) | (M_norm >= th_M_low)) & (S_norm <= th_S)
+    
+    # 低置信度区域：仅基于振幅或调制度
+    low_confidence = (A_norm >= th_A_low) | (M_norm >= th_M_low)
     
     # 强度约束
     intensity_valid = I_norm > th_I
     
-    # 根据置信度参数选择区域
-    if confidence >= 0.7:
+    # 根据置信度参数选择区域（修复：简化逻辑，主要基于振幅和调制度）
+    if confidence >= 0.8:
+        # 最严格：只要高振幅和高调制度
+        mask = high_confidence & intensity_valid
+    elif confidence >= 0.6:
+        # 严格：高置信度区域为主
         mask = high_confidence & intensity_valid
     elif confidence >= 0.4:
+        # 中等：高置信度区域 + 部分中等置信度区域
+        mask = (high_confidence | (medium_confidence & (A_norm >= th_A_high * 0.8))) & intensity_valid
+    elif confidence >= 0.2:
+        # 宽松：包含更多中等置信度区域
         mask = (high_confidence | medium_confidence) & intensity_valid
     else:
-        mask = medium_confidence & intensity_valid
+        # 最宽松：主要基于振幅和调制度，忽略稳定性
+        mask = low_confidence & intensity_valid
     
     return mask
 
 
 def otsu_thresholding_calibration(A_norm, M_norm, I_norm):
-    """改进的Otsu方法 - 投影仪标定版本"""
+    """改进的Otsu方法 - 改进版本（基于unwrap_phase.py）"""
     _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    th_I = np.percentile(I_norm, 50)
+    # 降低强度阈值，使更多区域通过
+    th_I = np.percentile(I_norm, 30)  # 从50降低到30
     mask_I = (I_norm > th_I).astype(np.uint8) * 255
     
     mask = np.logical_or(mask_A > 0, mask_M > 0)
@@ -431,12 +444,13 @@ def otsu_thresholding_calibration(A_norm, M_norm, I_norm):
 def relative_thresholding_calibration(A_norm, M_norm, I_norm, thresh_rel, confidence):
     """改进的相对阈值方法 - 投影仪标定版本"""
     if thresh_rel is None:
-        thresh_rel = 0.2
+        thresh_rel = 0.3  # 提高默认阈值，使掩码更宽松
     
-    adjusted_thresh_rel = float(thresh_rel) * (2 - float(confidence))
+    # 调整相对阈值计算，使其更宽松
+    adjusted_thresh_rel = float(thresh_rel) * (2.5 - float(confidence))  # 增加系数
     th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
     th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
-    th_I = np.percentile(I_norm, 50)
+    th_I = np.percentile(I_norm, 30)  # 降低强度阈值
     
     mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
     mask = np.logical_and(mask, I_norm > th_I)
@@ -448,20 +462,21 @@ def progressive_morphological_processing_calibration(mask, min_area):
     """渐进式形态学处理 - 投影仪标定版本"""
     mask = mask.astype(np.uint8)
     
+    # 更温和的形态学处理
     # 小尺度闭运算
-    mask = morphology.binary_closing(mask, morphology.disk(3))
+    mask = morphology.binary_closing(mask, morphology.disk(2))  # 减小核大小
     
-    # 移除小对象
-    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//4)
+    # 移除超小对象（更宽松）
+    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//8)  # 更小的阈值
     
     # 中等尺度闭运算
-    mask = morphology.binary_closing(mask, morphology.disk(5))
+    mask = morphology.binary_closing(mask, morphology.disk(3))  # 减小核大小
     
-    # 填充小孔洞
-    mask = morphology.remove_small_holes(mask, area_threshold=min_area//2)
+    # 填充小孔洞（更宽松）
+    mask = morphology.remove_small_holes(mask, area_threshold=min_area//4)  # 更小的阈值
     
-    # 最终移除小对象
-    mask = morphology.remove_small_objects(mask, min_size=min_area)
+    # 最终移除小对象（更宽松）
+    mask = morphology.remove_small_objects(mask, min_size=min_area//2)  # 更小的阈值
     
     return mask.astype(np.uint8)
 
@@ -877,11 +892,31 @@ def preprocess_image(img, board_type):
     返回:
         处理后的灰度图像
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 安全地转换为灰度图像
+    if len(img.shape) == 3:
+        # 彩色图像
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        # 已经是灰度图像
+        gray = img.copy()
 
     if board_type == 'chessboard':
-        # 基本处理，提高对比度
+        # 增强处理，提高对比度和亮度
+        # 1. 直方图均衡化
         gray = cv2.equalizeHist(gray)
+        
+        # 2. 自适应对比度增强（CLAHE）
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+        
+        # 3. 如果图像过暗，进行亮度增强
+        mean_brightness = np.mean(gray)
+        if mean_brightness < 80:  # 图像过暗
+            # 伽马校正增加亮度
+            gamma = 1.5
+            invGamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            gray = cv2.LUT(gray, table)
     elif board_type == 'circles':
         # 增强圆形检测
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -990,6 +1025,11 @@ class BoardDetectionError(CalibrationError):
 class CorrespondenceError(CalibrationError):
     """对应关系建立异常"""
     def __init__(self, message="无法建立足够的点对应关系"):
+        super().__init__(message)
+
+class UserCancelledError(CalibrationError):
+    """用户取消操作异常"""
+    def __init__(self, message="用户取消了标定操作"):
         super().__init__(message)
 
 # 改进ProjectorCalibration类，添加错误处理和日志记录
@@ -1287,12 +1327,33 @@ def detect_calibration_board(image, board_type, chessboard_size, square_size):
     detection_params = configure_detection_parameters(board_type)
     
     if board_type == 'chessboard':
+        # 添加调试信息
+        print(f"    图像尺寸: {gray.shape}, 平均亮度: {np.mean(gray):.1f}, 标定板尺寸: {chessboard_size}")
+        
         ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
         
         if ret:
             # 使用亚像素精度优化角点位置
             corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), detection_params['criteria'])
+            print(f"    成功检测到 {len(corners)} 个角点")
             return objp, corners
+        else:
+            print(f"    棋盘格角点检测失败 - 图像可能过暗或标定板不清晰")
+            # 尝试不同的检测标志
+            flags_to_try = [
+                cv2.CALIB_CB_ADAPTIVE_THRESH,
+                cv2.CALIB_CB_NORMALIZE_IMAGE,
+                cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE,
+                cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_FILTER_QUADS
+            ]
+            
+            for i, flags in enumerate(flags_to_try):
+                print(f"    尝试备用检测方法 {i+1}...")
+                ret, corners = cv2.findChessboardCorners(gray, chessboard_size, flags)
+                if ret:
+                    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), detection_params['criteria'])
+                    print(f"    备用方法成功！检测到 {len(corners)} 个角点")
+                    return objp, corners
     
     elif board_type in ['circles', 'ring_circles']:
         ret, corners = cv2.findCirclesGrid(
@@ -1953,7 +2014,7 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
                                    phase_images_folder, board_type="chessboard", chessboard_size=(9, 6),
                                    square_size=20.0, output_folder=None, visualize=True,
                                    global_optimization=True, sampling_step=5, adaptive_threshold=True,
-                                   n_steps=4, print_func=print,
+                                   n_steps=4, print_func=print, cancellation_check_func=None,
                                    mask_method: str = 'otsu', mask_confidence: float = 0.5):
     """
     基于相位解包裹的投影仪标定主函数 (新版，支持N步相移和子文件夹)
@@ -1979,6 +2040,9 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
         adaptive_threshold: 是否使用自适应方法计算质量阈值
         n_steps: 相移步数 (N), 默认为4.
         print_func: 用于打印消息的函数，默认为print。
+        cancellation_check_func: 用于检查是否取消操作的函数，返回True时取消操作。
+        mask_method: 掩膜生成方法 ('otsu', 'adaptive', 'relative')
+        mask_confidence: 掩膜置信度阈值 (0.1-0.9)
     """
     print_func(f"投影仪标定程序 (基于相位解包裹 - v2.1 支持N步相移)")
     print_func("=" * 60)
@@ -2004,9 +2068,7 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
     # 加载相机参数
     print_func("\n步骤 1: 加载相机参数...")
     try:
-        calib_data = calibration.load_camera_params(camera_params_file=camera_params_file)
-        camera_matrix = calib_data['camera_matrix']
-        camera_distortion = calib_data['dist_coeffs']
+        camera_matrix, camera_distortion = calibration.load_camera_params(camera_params_file=camera_params_file)
         print_func(f"成功从 {camera_params_file} 加载相机参数。")
     except Exception as e:
         raise CalibrationError(f"加载相机参数失败: {e}")
@@ -2031,6 +2093,10 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
     iterator = tqdm(pose_dirs, desc="处理姿态子文件夹", unit="pose") if TQDM_AVAILABLE else pose_dirs
 
     for pose_name in iterator:
+        # 检查是否取消操作
+        if cancellation_check_func and cancellation_check_func():
+            raise UserCancelledError("用户取消了投影仪标定操作")
+            
         pose_dir = os.path.join(phase_images_folder, pose_name)
         print_func(f"\n--- 正在处理姿态: {pose_name} ({n_steps}步相移) ---")
 
@@ -2108,7 +2174,9 @@ def phase_based_projector_calibration(projector_width, projector_height, camera_
             # 使用垂直相移的平均强度图进行角点检测
             cam_img = base_image_v
             if cam_img is None: # 如果处理函数没返回，就自己读一张
-                cam_img = cv2.imread(v_paths[0])
+                cam_img = cv2.imread(v_paths[0], cv2.IMREAD_COLOR)  # 明确指定读取彩色图像
+                if cam_img is None:
+                    raise FileNotFoundError(f"无法读取图像: {v_paths[0]}")
             
             # 检测标定板角点
             print_func("  - 检测标定板角点...")

@@ -11,6 +11,12 @@
 2. 运行程序，按照提示输入图像文件夹路径、标定板类型、标定点数量和实际尺寸
 3. 程序将自动进行标定，并保存结果
 
+支持的图像格式：
+- JPG/JPEG (.jpg, .jpeg)
+- PNG (.png)
+- BMP (.bmp)
+- TIFF (.tif, .tiff)
+
 支持的标定板类型：
 - 棋盘格标定板 (chessboard)：使用findChessboardCorners检测
 - 圆形标定板 (circles)：使用findCirclesGrid检测，默认为白底黑圆
@@ -37,6 +43,30 @@ try:
     print("已配置matplotlib支持中文显示")
 except:
     print("配置matplotlib中文支持失败，图像中的中文可能无法正常显示")
+
+# 工具函数：获取文件夹中所有支持的图像文件
+def get_image_files(folder_path):
+    """
+    获取指定文件夹中所有支持的图像文件
+    
+    参数:
+        folder_path: 图像文件夹路径
+        
+    返回:
+        images: 图像文件路径列表（去重后）
+    """
+    supported_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']
+    images = set()  # 使用set避免重复
+    
+    for ext in supported_extensions:
+        images.update(glob.glob(os.path.join(folder_path, ext)))
+        # 同时支持大写扩展名
+        images.update(glob.glob(os.path.join(folder_path, ext.upper())))
+    
+    # 转换为列表并按文件名排序
+    images = list(images)
+    images.sort()
+    return images
 
 # 定义OpenCV显示中文文本的函数
 def put_chinese_text(img, text, position, font_size=30, color=(0, 0, 255)):
@@ -208,17 +238,37 @@ def preprocess_image(img, board_type):
     根据标定板类型优化图像预处理
     
     参数:
-        img: 输入图像
+        img: 输入图像（可以是彩色或灰度图像）
         board_type: 标定板类型
         
     返回:
         处理后的灰度图像
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 安全地转换为灰度图像
+    if len(img.shape) == 3:
+        # 彩色图像，转换为灰度
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        # 已经是灰度图像，直接复制
+        gray = img.copy()
     
     if board_type == 'chessboard':
-        # 基本处理，提高对比度
+        # 增强处理，提高对比度和亮度（特别针对灰度图像）
+        # 1. 直方图均衡化
         gray = cv2.equalizeHist(gray)
+        
+        # 2. 自适应对比度增强（CLAHE）
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+        
+        # 3. 如果图像过暗，进行亮度增强
+        mean_brightness = np.mean(gray)
+        if mean_brightness < 80:  # 图像过暗
+            # 伽马校正增加亮度
+            gamma = 1.5
+            invGamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            gray = cv2.LUT(gray, table)
     elif board_type == 'circles':
         # 增强圆形检测
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -299,11 +349,10 @@ def calibrate_camera(images_folder, board_type="chessboard", board_size=(9, 6), 
     imgpoints = []  # 图像平面上的点
     
     # 获取图像文件列表
-    images = glob.glob(os.path.join(images_folder, '*.jpg'))
-    images.extend(glob.glob(os.path.join(images_folder, '*.png')))
+    images = get_image_files(images_folder)
     
     if len(images) == 0:
-        raise ValueError(f"在文件夹 '{images_folder}' 中未找到jpg或png图像文件")
+        raise ValueError(f"在文件夹 '{images_folder}' 中未找到支持的图像文件 (jpg, jpeg, png, bmp, tif, tiff)")
     
     # 图像尺寸
     img_shape = None
@@ -323,7 +372,15 @@ def calibrate_camera(images_folder, board_type="chessboard", board_size=(9, 6), 
     # 处理每张图像
     successful_images = []
     for i, fname in enumerate(images):
-        img = cv2.imread(fname)
+        # 先尝试以彩色模式读取
+        img = cv2.imread(fname, cv2.IMREAD_COLOR)
+        if img is None:
+            # 如果彩色模式失败，尝试以灰度模式读取
+            img = cv2.imread(fname, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                # 将灰度图像转换为3通道以保持一致性
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        
         if img is None:
             print(f"无法读取图像: {fname}")
             continue
@@ -337,6 +394,10 @@ def calibrate_camera(images_folder, board_type="chessboard", board_size=(9, 6), 
         # 寻找标定板角点或圆心
         found = False
         if board_type == 'chessboard':
+            # 添加调试信息
+            print(f"    处理图像: {os.path.basename(fname)}")
+            print(f"    图像尺寸: {gray.shape}, 平均亮度: {np.mean(gray):.1f}, 标定板尺寸: {board_size}")
+            
             # 寻找棋盘格角点
             ret, corners = cv2.findChessboardCorners(gray, board_size, None)
             
@@ -347,10 +408,35 @@ def calibrate_camera(images_folder, board_type="chessboard", board_size=(9, 6), 
                 criteria = detection_params['criteria']
                 corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
                 imgpoints.append(corners2)
+                print(f"    成功检测到 {len(corners2)} 个角点")
                 
                 # 绘制并显示角点
                 if visualize:
                     cv2.drawChessboardCorners(img, board_size, corners2, ret)
+            else:
+                print(f"    棋盘格角点检测失败 - 尝试备用方法")
+                # 尝试不同的检测标志
+                flags_to_try = [
+                    cv2.CALIB_CB_ADAPTIVE_THRESH,
+                    cv2.CALIB_CB_NORMALIZE_IMAGE,
+                    cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE,
+                    cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_FILTER_QUADS
+                ]
+                
+                for j, flags in enumerate(flags_to_try):
+                    print(f"    尝试备用检测方法 {j+1}...")
+                    ret, corners = cv2.findChessboardCorners(gray, board_size, flags)
+                    if ret:
+                        found = True
+                        criteria = detection_params['criteria']
+                        corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+                        imgpoints.append(corners2)
+                        print(f"    备用方法成功！检测到 {len(corners2)} 个角点")
+                        
+                        # 绘制并显示角点
+                        if visualize:
+                            cv2.drawChessboardCorners(img, board_size, corners2, ret)
+                        break
         elif board_type in ['circles', 'ring_circles']:
             # 寻找圆形网格模式
             flags = detection_params['flags']
@@ -494,7 +580,15 @@ def test_undistortion(image_path, camera_matrix, dist_coeffs, output_folder=None
     返回:
         dst: 校正后的图像
     """
-    img = cv2.imread(image_path)
+    # 先尝试以彩色模式读取
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        # 如果彩色模式失败，尝试以灰度模式读取
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            # 将灰度图像转换为3通道以保持一致性
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    
     if img is None:
         print(f"无法读取图像: {image_path}")
         return None
@@ -693,8 +787,7 @@ def main():
             # 如果没有提供测试图像，询问用户是否要使用一张标定图像作为测试
             response = input("\n是否要测试畸变校正? (y/n) [默认:y]: ").strip().lower()
             if not response or response == 'y':
-                images = glob.glob(os.path.join(images_folder, '*.jpg'))
-                images.extend(glob.glob(os.path.join(images_folder, '*.png')))
+                images = get_image_files(images_folder)
                 if images:
                     test_image = images[0]  # 使用第一张图像作为测试
         
