@@ -814,12 +814,12 @@ class CameraCalibrationWindow(QMainWindow):
     def _test_undistortion(self):
         """测试畸变校正"""
         if not self.calibration_result:
-            QMessageBox.warning(self, "错误", "请先执行标定")
+            QMessageBox.warning(self, "Error", "Please run calibration first")
             return
             
         # 选择测试图像
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择测试图像", "", "图像文件 (*.jpg *.jpeg *.png *.bmp);;所有文件 (*.*)"
+            self, "Select Test Image", "", "Image Files (*.jpg *.jpeg *.png *.bmp);;All Files (*.*)"
         )
         
         if not file_path:
@@ -840,37 +840,46 @@ class CameraCalibrationWindow(QMainWindow):
                     original_img = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
             
             if original_img is None:
-                raise ValueError(f"无法读取图像: {file_path}")
+                raise ValueError(f"Cannot read image: {file_path}")
+            
+            # 确保original_img是numpy数组
+            if not isinstance(original_img, np.ndarray):
+                raise ValueError(f"Image data is not a numpy array: {type(original_img)}")
                 
             # 执行畸变校正
             undistorted_img = cam_calib.test_undistortion(
                 file_path, camera_matrix, dist_coeffs, output_folder=None
             )
             
+            # 确保undistorted_img是numpy数组
+            if undistorted_img is not None and not isinstance(undistorted_img, np.ndarray):
+                raise ValueError(f"Undistorted image data is not a numpy array: {type(undistorted_img)}")
+            
             if undistorted_img is not None:
-                # 显示对比图像
-                h, w = original_img.shape[:2]
+                # 设置固定显示尺寸
+                display_width, display_height = 1080, 720
                 
-                # 调整校正后图像大小以匹配原始图像
-                undistorted_img_resized = cv2.resize(undistorted_img, (w, h))
+                # 调整原始图像和校正后图像到固定显示尺寸
+                original_img_resized = cv2.resize(original_img, (display_width, display_height))
+                undistorted_img_resized = cv2.resize(undistorted_img, (display_width, display_height))
                 
                 # 创建并排比较图像
-                comparison = np.zeros((h, w*2, 3), dtype=np.uint8)
-                comparison[:, :w] = original_img
-                comparison[:, w:] = undistorted_img_resized
+                comparison = np.zeros((display_height, display_width*2, 3), dtype=np.uint8)
+                comparison[:, :display_width] = original_img_resized
+                comparison[:, display_width:] = undistorted_img_resized
                 
                 # 添加标签
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                cv2.putText(comparison, "原始图像", (50, 30), font, 1, (0, 255, 0), 2)
-                cv2.putText(comparison, "校正后", (w+50, 30), font, 1, (0, 255, 0), 2)
+                cv2.putText(comparison, "Original", (50, 50), font, 1.5, (0, 255, 0), 3)
+                cv2.putText(comparison, "Undistorted", (display_width+50, 50), font, 1.5, (0, 255, 0), 3)
                 
                 # 显示结果
-                cv2.imshow("畸变校正结果", comparison)
+                cv2.imshow("Distortion Correction Result", comparison)
                 cv2.waitKey(0)
                 cv2.destroyAllWindows()
                 
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"畸变校正失败: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Distortion correction failed: {str(e)}")
 
 def main():
     """主函数"""

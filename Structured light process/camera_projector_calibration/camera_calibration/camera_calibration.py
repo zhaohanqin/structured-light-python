@@ -611,31 +611,42 @@ def test_undistortion(image_path, camera_matrix, dist_coeffs, output_folder=None
     # 创建比较图像
     comparison = np.hstack((img, dst))
     
+    # 将图像调整为固定显示尺寸
+    display_width, display_height = 1080, 720
+    
+    # 调整所有图像到显示尺寸
+    img_display = cv2.resize(img, (display_width, display_height))
+    dst_display = cv2.resize(dst, (display_width, display_height))
+    dst_cropped_display = cv2.resize(dst_cropped, (display_width, display_height))
+    
+    # 创建并排对比图像
+    comparison_display = np.hstack((img_display, dst_display))
+    
     # 显示原始图像和校正后的图像
     plt.figure(figsize=(15, 10))
     
     # 原始图像
     plt.subplot(221)
-    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    plt.title('原始图像')
+    plt.imshow(cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB))
+    plt.title('Original Image')
     plt.axis('off')
     
     # 校正后未裁剪的图像
     plt.subplot(222)
-    plt.imshow(cv2.cvtColor(dst, cv2.COLOR_BGR2RGB))
-    plt.title('校正后图像 (未裁剪)')
+    plt.imshow(cv2.cvtColor(dst_display, cv2.COLOR_BGR2RGB))
+    plt.title('Undistorted Image (Uncropped)')
     plt.axis('off')
     
     # 校正后裁剪的图像
     plt.subplot(223)
-    plt.imshow(cv2.cvtColor(dst_cropped, cv2.COLOR_BGR2RGB))
-    plt.title('校正后图像 (裁剪)')
+    plt.imshow(cv2.cvtColor(dst_cropped_display, cv2.COLOR_BGR2RGB))
+    plt.title('Undistorted Image (Cropped)')
     plt.axis('off')
     
     # 原始与校正后的对比
     plt.subplot(224)
-    plt.imshow(cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB))
-    plt.title('原始图像 vs 校正后图像')
+    plt.imshow(cv2.cvtColor(comparison_display, cv2.COLOR_BGR2RGB))
+    plt.title('Original vs Undistorted')
     plt.axis('off')
     
     plt.tight_layout()
@@ -663,9 +674,13 @@ def test_undistortion(image_path, camera_matrix, dist_coeffs, output_folder=None
         plt_path = os.path.join(output_folder, f"{base_name}_undistortion_results.png")
         plt.savefig(plt_path, dpi=300, bbox_inches='tight')
         
-        print(f"校正结果已保存至: {output_folder}")
+        print(f"Correction results saved to: {output_folder}")
     
     plt.show()
+    
+    # 确保返回的是numpy数组而不是列表
+    if isinstance(dst_cropped, list):
+        dst_cropped = np.array(dst_cropped)
     
     return dst_cropped
 
