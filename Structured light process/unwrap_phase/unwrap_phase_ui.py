@@ -394,9 +394,9 @@ class PhaseUnwrapperUI(QMainWindow):
         self.horizontal_images = []  # 水平方向（垂直条纹）图像
         self.vertical_images = []    # 垂直方向（水平条纹）图像
         self.unwrap_direction = UnwrapDirection.BOTH
-        self.unwrap_method = "quality_guided"
-        self.mask_method = "otsu"  # 基于测试结果，Otsu方法最稳定
-        self.mask_confidence = 0.6  # 掩膜置信度，范围0.1-0.9（修复后的推荐值）
+        self.unwrap_method = "improved_quality_guided"  # 默认使用改进的质量引导法
+        self.mask_method = "otsu"  # 仅使用Otsu方法
+        self.mask_confidence = 0.6  # 掩膜置信度，范围0.1-0.9
         self.output_dir = "phase_unwrap_results"
         self.combined_viewer_window = None # 用于持有对新窗口的引用
         
@@ -598,30 +598,22 @@ class PhaseUnwrapperUI(QMainWindow):
         # 创建下拉菜单
         self.method_combo = QComboBox()
         self.method_combo.addItem("质量引导法 (原始)", "quality_guided")
-        self.method_combo.addItem("改进质量引导法", "improved_quality_guided")
+        self.method_combo.addItem("改进质量引导法 (推荐)", "improved_quality_guided")
         self.method_combo.addItem("鲁棒解包裹法", "robust")
+        self.method_combo.setCurrentIndex(1)  # 默认选择改进质量引导法
         self.method_combo.currentIndexChanged.connect(self.update_unwrap_method)
         self.method_combo.setToolTip("选择用于执行相位解包裹的核心算法。\n"
                                    "• 质量引导法(原始): 基础的质量引导解包裹\n"
-                                   "• 改进质量引导法: 结合相位梯度的改进算法\n"
+                                   "• 改进质量引导法(推荐): 结合相位梯度的改进算法\n"
                                    "• 鲁棒解包裹法: 结合相位跳跃的鲁棒算法")
         
         method_layout.addWidget(QLabel("选择解包裹算法:"))
         method_layout.addWidget(self.method_combo)
 
-        # 掩膜方法选择
-        method_layout.addWidget(QLabel("掩膜生成方法:"))
-        self.mask_combo = QComboBox()
-        self.mask_combo.addItem("Otsu 自适应阈值 (推荐)", "otsu")
-        self.mask_combo.addItem("自适应阈值", "adaptive")
-        self.mask_combo.addItem("相对百分位阈值", "relative")
-        self.mask_combo.setCurrentIndex(0)  # 默认选择otsu
-        self.mask_combo.currentIndexChanged.connect(self.update_mask_method)
-        self.mask_combo.setToolTip("选择用于生成投影区域掩膜的方法：\n"
-                                   "• Otsu 自适应阈值 (推荐): 基于Otsu算法，稳定可靠\n"
-                                   "• 自适应阈值: 结合多特征的智能阈值化\n"
-                                   "• 相对百分位阈值: 基于百分位的相对阈值方法")
-        method_layout.addWidget(self.mask_combo)
+        # 掩膜生成方法说明（固定使用Otsu方法）
+        mask_info_label = QLabel("掩膜生成方法: Otsu自适应阈值")
+        mask_info_label.setStyleSheet("color: #2c3e50; font-weight: bold;")
+        method_layout.addWidget(mask_info_label)
         
         # 掩膜置信度（仅数值输入）
         confidence_layout = QHBoxLayout()
@@ -633,9 +625,8 @@ class PhaseUnwrapperUI(QMainWindow):
         self.confidence_spinbox.setValue(0.6)
         self.confidence_spinbox.valueChanged.connect(self.update_mask_confidence_from_spinbox)
         self.confidence_spinbox.setToolTip("输入 0.1-0.9 的数值以设置掩膜置信度\n\n"
-                                         "• 自适应方法：结合振幅、调制度、相位稳定性等多特征\n"
-                                         "• Otsu方法：置信度对此方法影响较小\n"
-                                         "• 相对阈值方法：基于百分位的阈值选择")
+                                         "• Otsu方法：基于Otsu算法的自动阈值化\n"
+                                         "• 置信度对Otsu方法影响较小")
         confidence_layout.addWidget(self.confidence_spinbox)
         method_layout.addLayout(confidence_layout)
         
@@ -845,13 +836,6 @@ class PhaseUnwrapperUI(QMainWindow):
         """更新解包裹方法"""
         self.unwrap_method = self.method_combo.itemData(index)
 
-    @Slot(int)
-    def update_mask_method(self, index: int):
-        """更新掩膜方法"""
-        self.mask_method = self.mask_combo.itemData(index)
-        # 更新置信度信息显示
-        self.update_confidence_info()
-    
     @Slot(float)
     def update_mask_confidence_from_spinbox(self, value: float):
         """从数值框更新掩膜置信度"""
@@ -859,41 +843,19 @@ class PhaseUnwrapperUI(QMainWindow):
         self.update_confidence_info()
     
     def update_confidence_info(self):
-        """更新置信度说明信息"""
+        """更新置信度说明信息（仅Otsu方法）"""
         confidence = self.mask_confidence
-        method = self.mask_method
         
-        # 根据不同方法提供不同的建议
-        if method == "adaptive":
-            if confidence < 0.4:
-                info = f"当前值: {confidence:.1f} (自适应-宽松，保留更多区域但可能含噪声)"
-                color = "#ff9500"  # 橙色
-            elif confidence <= 0.6:
-                info = f"当前值: {confidence:.1f} (自适应-推荐，智能多特征平衡)"
-                color = "#51cf66"  # 绿色
-            else:
-                info = f"当前值: {confidence:.1f} (自适应-严格，仅保留高质量区域)"
-                color = "#339af0"  # 蓝色
-        elif method == "otsu":
-            if confidence < 0.4:
-                info = f"当前值: {confidence:.1f} (Otsu方法，置信度对此方法影响较小)"
-                color = "#868e96"  # 灰色
-            elif confidence <= 0.6:
-                info = f"当前值: {confidence:.1f} (Otsu方法，传统自动阈值化)"
-                color = "#51cf66"  # 绿色
-            else:
-                info = f"当前值: {confidence:.1f} (Otsu方法，置信度对此方法影响较小)"
-                color = "#868e96"  # 灰色
-        else:  # relative
-            if confidence < 0.4:
-                info = f"当前值: {confidence:.1f} (相对阈值-宽松，保留更多百分位)"
-                color = "#ff6b6b"  # 红色
-            elif confidence <= 0.6:
-                info = f"当前值: {confidence:.1f} (相对阈值-推荐，平衡百分位选择)"
-                color = "#51cf66"  # 绿色
-            else:
-                info = f"当前值: {confidence:.1f} (相对阈值-严格，仅保留高百分位)"
-                color = "#ffd43b"  # 黄色
+        # Otsu方法的说明
+        if confidence < 0.4:
+            info = f"当前值: {confidence:.1f} (Otsu方法，置信度对此方法影响较小)"
+            color = "#868e96"  # 灰色
+        elif confidence <= 0.6:
+            info = f"当前值: {confidence:.1f} (Otsu方法，传统自动阈值化)"
+            color = "#51cf66"  # 绿色
+        else:
+            info = f"当前值: {confidence:.1f} (Otsu方法，置信度对此方法影响较小)"
+            color = "#868e96"  # 灰色
         
         self.confidence_info_label.setText(info)
         self.confidence_info_label.setStyleSheet(f"color: {color}; font-size: 11px; font-style: italic;")

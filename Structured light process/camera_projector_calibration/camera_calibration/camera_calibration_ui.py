@@ -320,7 +320,7 @@ class CameraCalibrationWindow(QMainWindow):
         """初始化UI"""
         # 设置窗口属性
         self.setWindowTitle("相机标定工具")
-        self.setMinimumSize(900, 700)
+        self.setMinimumSize(1200, 750)
         
         # 设置应用主题
         self._set_application_style()
@@ -329,197 +329,271 @@ class CameraCalibrationWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # 创建主布局
+        # 创建主布局（垂直）
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 10, 15, 10)
+        main_layout.setSpacing(10)
         
-        # 创建标题和说明
+        # 创建标题区域
         title_label = QLabel("相机标定工具")
-        title_label.setStyleSheet("font-size: 24px; font-weight: bold; margin: 10px 0;")
+        title_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #1976d2;")
         title_label.setAlignment(Qt.AlignCenter)
         
-        description_label = QLabel("通过一系列标定板图像计算相机内参矩阵和畸变系数")
-        description_label.setStyleSheet("font-size: 14px; color: #616161; margin-bottom: 20px;")
+        description_label = QLabel("通过标定板图像计算相机内参矩阵和畸变系数")
+        description_label.setStyleSheet("font-size: 13px; color: #616161;")
         description_label.setAlignment(Qt.AlignCenter)
         
         main_layout.addWidget(title_label)
         main_layout.addWidget(description_label)
         
-        # 创建滚动区域以容纳所有内容
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
+        # ===== 主工作区：左右分栏布局 =====
+        work_layout = QHBoxLayout()
+        work_layout.setSpacing(15)
         
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(20, 10, 20, 20)
-        scroll_layout.setSpacing(15)
+        # ----- 左侧：参数配置区 -----
+        left_panel = CardWidget()
+        left_panel.setMinimumWidth(450)
+        left_panel.setMaximumWidth(550)
         
-        # ===== 第一卡片：选择图像 =====
-        images_card = CardWidget()
-        scroll_layout.addWidget(images_card)
+        # 1. 图像文件夹选择
+        folder_group = QGroupBox("标定图像")
+        folder_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                color: #2196f3;
+                border: 2px solid #e3f2fd;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
+        folder_layout = QVBoxLayout(folder_group)
         
-        # 标题
-        title_label = QLabel("1. 选择标定图像")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196f3;")
-        images_card.layout.addWidget(title_label)
-        
-        # 选择图像文件夹
-        folder_layout = QHBoxLayout()
+        folder_select_layout = QHBoxLayout()
         self.images_folder_edit = QLineEdit()
-        self.images_folder_edit.setPlaceholderText("标定图像所在文件夹路径")
-        self.images_folder_edit.setToolTip("请选择包含多张从不同角度拍摄的标定板图像的文件夹。")
-        browse_button = StylishButton("浏览...", primary=False)
-        browse_button.setToolTip("点击浏览并选择包含标定图像的文件夹。")
+        self.images_folder_edit.setPlaceholderText("选择包含标定图像的文件夹")
+        browse_button = StylishButton("浏览", primary=False)
+        browse_button.setMaximumWidth(80)
         browse_button.clicked.connect(self._browse_images_folder)
-        folder_layout.addWidget(self.images_folder_edit, 7)
-        folder_layout.addWidget(browse_button, 1)
-        images_card.layout.addLayout(folder_layout)
+        folder_select_layout.addWidget(self.images_folder_edit)
+        folder_select_layout.addWidget(browse_button)
+        folder_layout.addLayout(folder_select_layout)
         
-        # 图像预览区域
-        preview_layout = QHBoxLayout()
+        left_panel.layout.addWidget(folder_group)
         
-        # 图像预览
-        self.image_preview = ImagePreview()
-        self.image_preview.clicked.connect(lambda: self._browse_images_folder(True))
+        # 2. 标定板配置
+        board_group = QGroupBox("标定板配置")
+        board_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                color: #2196f3;
+                border: 2px solid #e3f2fd;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
+        board_layout = QVBoxLayout(board_group)
         
-        # 图像列表
-        self.images_list = QListWidget()
-        self.images_list.setMaximumWidth(200)
-        self.images_list.itemClicked.connect(self._on_image_clicked)
-        preview_layout.addWidget(self.images_list)
-        preview_layout.addWidget(self.image_preview)
-        
-        images_card.layout.addLayout(preview_layout)
-        
-        # ===== 第二卡片：标定板类型 =====
-        board_card = CardWidget()
-        scroll_layout.addWidget(board_card)
-        
-        # 标题
-        title_label = QLabel("2. 选择标定板类型")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196f3;")
-        board_card.layout.addWidget(title_label)
-        
-        # 标定板类型选择
+        # 标定板类型
         board_type_layout = QHBoxLayout()
+        board_type_layout.addWidget(QLabel("类型:"))
         self.board_type_combo = QComboBox()
-        self.board_type_combo.addItem("棋盘格标定板", "chessboard")
-        self.board_type_combo.addItem("圆形标定板 (白底黑圆)", "circles")
-        self.board_type_combo.addItem("空心圆环标定板", "ring_circles")
+        self.board_type_combo.addItem("棋盘格", "chessboard")
+        self.board_type_combo.addItem("圆形 (白底黑圆)", "circles")
+        self.board_type_combo.addItem("空心圆环", "ring_circles")
         self.board_type_combo.currentIndexChanged.connect(self._update_board_tips)
-        self.board_type_combo.setToolTip("选择您使用的标定板类型。\n- 棋盘格: 最常用，精度高。\n- 圆形: 对光照变化不敏感。\n- 空心圆环: 适合高反光表面。")
+        board_type_layout.addWidget(self.board_type_combo, 1)
+        board_layout.addLayout(board_type_layout)
         
-        board_type_layout.addWidget(QLabel("标定板类型:"))
-        board_type_layout.addWidget(self.board_type_combo)
-        board_type_layout.addStretch()
+        # 标定板尺寸 - 使用网格布局
+        size_grid = QGridLayout()
+        size_grid.setColumnStretch(1, 1)
+        size_grid.setColumnStretch(3, 1)
         
-        board_card.layout.addLayout(board_type_layout)
-        
-        # 标定板提示
-        self.board_tips_label = QLabel()
-        self.board_tips_label.setWordWrap(True)
-        self.board_tips_label.setStyleSheet("background-color: #e3f2fd; padding: 10px; border-radius: 5px;")
-        board_card.layout.addWidget(self.board_tips_label)
-        
-        # 默认更新提示
-        self._update_board_tips()
-        
-        # ===== 第三卡片：标定板尺寸 =====
-        size_card = CardWidget()
-        scroll_layout.addWidget(size_card)
-        
-        # 标题
-        title_label = QLabel("3. 配置标定板尺寸")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196f3;")
-        size_card.layout.addWidget(title_label)
-        
-        # 标定板尺寸配置
-        board_size_layout = QFormLayout()
-        board_size_layout.setLabelAlignment(Qt.AlignRight)
-        
-        # 水平点数
         self.board_width = QSpinBox()
         self.board_width.setRange(2, 20)
         self.board_width.setValue(9)
-        self.board_width.setToolTip("标定板上水平方向的内角点或圆心数量。\n例如，一个9x6的棋盘格，水平点数是9。")
+        self.board_width.setToolTip("水平方向的内角点或圆心数量")
         
-        # 垂直点数
         self.board_height = QSpinBox()
         self.board_height.setRange(2, 20)
         self.board_height.setValue(6)
-        self.board_height.setToolTip("标定板上垂直方向的内角点或圆心数量。\n例如，一个9x6的棋盘格，垂直点数是6。")
+        self.board_height.setToolTip("垂直方向的内角点或圆心数量")
         
-        # 实际尺寸
+        size_grid.addWidget(QLabel("水平点数:"), 0, 0)
+        size_grid.addWidget(self.board_width, 0, 1)
+        size_grid.addWidget(QLabel("垂直点数:"), 0, 2)
+        size_grid.addWidget(self.board_height, 0, 3)
+        
+        board_layout.addLayout(size_grid)
+        
+        # 方格尺寸
+        square_layout = QHBoxLayout()
+        square_layout.addWidget(QLabel("方格尺寸:"))
         self.square_size = QDoubleSpinBox()
         self.square_size.setRange(1, 1000)
         self.square_size.setValue(20.0)
         self.square_size.setSuffix(" mm")
-        self.square_size.setToolTip("标定板上单个方格的边长，或相邻圆心的距离（单位：毫米）。\n这个值的准确性直接影响标定结果的尺度。")
+        self.square_size.setToolTip("单个方格边长或相邻圆心距离")
+        square_layout.addWidget(self.square_size, 1)
+        board_layout.addLayout(square_layout)
         
-        board_size_layout.addRow("水平点数:", self.board_width)
-        board_size_layout.addRow("垂直点数:", self.board_height)
-        board_size_layout.addRow("实际尺寸:", self.square_size)
+        # 标定板提示
+        self.board_tips_label = QLabel()
+        self.board_tips_label.setWordWrap(True)
+        self.board_tips_label.setStyleSheet("""
+            background-color: #e3f2fd; 
+            padding: 8px; 
+            border-radius: 4px;
+            font-size: 11px;
+            color: #1565c0;
+        """)
+        board_layout.addWidget(self.board_tips_label)
         
-        size_card.layout.addLayout(board_size_layout)
+        left_panel.layout.addWidget(board_group)
         
-        # ===== 第四卡片：执行标定 =====
-        action_card = CardWidget()
-        scroll_layout.addWidget(action_card)
+        # 3. 标定选项
+        options_group = QGroupBox("标定选项")
+        options_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                color: #2196f3;
+                border: 2px solid #e3f2fd;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
+        options_layout = QVBoxLayout(options_group)
         
-        # 标题
-        title_label = QLabel("4. 执行标定")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196f3;")
-        action_card.layout.addWidget(title_label)
-        
-        # 可视化选项
-        viz_layout = QHBoxLayout()
-        self.show_corners_check = QCheckBox("显示检测到的角点")
+        self.show_corners_check = QCheckBox("实时显示检测到的角点")
         self.show_corners_check.setChecked(True)
-        self.show_corners_check.setToolTip("如果选中，在标定过程中会实时弹窗显示每张图像上检测到的角点或圆心，方便检查检测效果。")
+        options_layout.addWidget(self.show_corners_check)
         
-        viz_layout.addWidget(self.show_corners_check)
-        viz_layout.addStretch()
+        left_panel.layout.addWidget(options_group)
         
-        action_card.layout.addLayout(viz_layout)
+        # 4. 执行标定区域
         
-        # 标定进度条
+        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        action_card.layout.addWidget(self.progress_bar)
+        self.progress_bar.setTextVisible(True)
+        left_panel.layout.addWidget(self.progress_bar)
         
-        # 标定按钮
+        # 按钮布局
         buttons_layout = QHBoxLayout()
-        
-        self.calibrate_button = StylishButton("执行标定")
-        self.calibrate_button.setToolTip("点击开始使用选定的图像和参数进行相机标定。")
+        self.calibrate_button = StylishButton("开始标定")
+        self.calibrate_button.setMinimumHeight(42)
         self.calibrate_button.clicked.connect(self._run_calibration)
         
-        self.test_button = StylishButton("测试畸变校正", primary=False)
-        self.test_button.setToolTip("标定完成后，点击此按钮并选择一张图片，以预览畸变校正的效果。")
+        self.test_button = StylishButton("测试校正", primary=False)
+        self.test_button.setMinimumHeight(42)
         self.test_button.clicked.connect(self._test_undistortion)
-        self.test_button.setEnabled(False)  # 初始状态下禁用
+        self.test_button.setEnabled(False)
         
-        buttons_layout.addWidget(self.calibrate_button)
-        buttons_layout.addWidget(self.test_button)
+        buttons_layout.addWidget(self.calibrate_button, 2)
+        buttons_layout.addWidget(self.test_button, 1)
+        left_panel.layout.addLayout(buttons_layout)
         
-        action_card.layout.addLayout(buttons_layout)
-        
-        # 标定结果标签
+        # 5. 标定结果显示
         self.result_label = QLabel()
         self.result_label.setVisible(False)
         self.result_label.setWordWrap(True)
-        self.result_label.setStyleSheet("background-color: #e8f5e9; padding: 10px; border-radius: 5px;")
-        action_card.layout.addWidget(self.result_label)
+        self.result_label.setStyleSheet("""
+            background-color: #e8f5e9; 
+            padding: 12px; 
+            border-radius: 6px;
+            border: 1px solid #4caf50;
+            font-size: 12px;
+            color: #2e7d32;
+        """)
+        left_panel.layout.addWidget(self.result_label)
         
-        # 设置滚动区域
-        scroll_area.setWidget(scroll_content)
-        main_layout.addWidget(scroll_area)
+        # 添加弹性空间
+        left_panel.layout.addStretch()
+        
+        # ----- 右侧：图像预览区 -----
+        right_panel = CardWidget()
+        
+        # 图像列表标题
+        list_title_layout = QHBoxLayout()
+        list_title = QLabel("标定图像列表")
+        list_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #2196f3;")
+        self.image_count_label = QLabel("(0 张)")
+        self.image_count_label.setStyleSheet("font-size: 12px; color: #757575;")
+        list_title_layout.addWidget(list_title)
+        list_title_layout.addWidget(self.image_count_label)
+        list_title_layout.addStretch()
+        right_panel.layout.addLayout(list_title_layout)
+        
+        # 图像列表（横向显示，较矮）
+        self.images_list = QListWidget()
+        self.images_list.setMaximumHeight(120)
+        self.images_list.setFlow(QListWidget.LeftToRight)
+        self.images_list.setWrapping(True)
+        self.images_list.setResizeMode(QListWidget.Adjust)
+        self.images_list.setIconSize(QSize(80, 60))
+        self.images_list.itemClicked.connect(self._on_image_clicked)
+        self.images_list.setStyleSheet("""
+            QListWidget::item {
+                border: 2px solid transparent;
+                border-radius: 4px;
+                padding: 2px;
+                margin: 2px;
+            }
+            QListWidget::item:selected {
+                border: 2px solid #2196f3;
+                background-color: #e3f2fd;
+            }
+            QListWidget::item:hover {
+                background-color: #f5f5f5;
+            }
+        """)
+        right_panel.layout.addWidget(self.images_list)
+        
+        # 图像预览区域
+        preview_title = QLabel("图像预览")
+        preview_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #2196f3; margin-top: 5px;")
+        right_panel.layout.addWidget(preview_title)
+        
+        self.image_preview = ImagePreview()
+        self.image_preview.clicked.connect(lambda: self._browse_images_folder(True))
+        self.image_preview.setMinimumHeight(400)
+        right_panel.layout.addWidget(self.image_preview, 1)
+        
+        # 添加左右面板到工作区
+        work_layout.addWidget(left_panel)
+        work_layout.addWidget(right_panel, 1)
+        
+        main_layout.addLayout(work_layout, 1)
         
         # 状态栏
-        self.statusBar().showMessage("就绪")
+        self.statusBar().showMessage("就绪 - 请选择标定图像文件夹开始")
         
         # 初始化变量
         self.calibration_result = None
+        
+        # 更新标定板提示
+        self._update_board_tips()
         
     def _set_application_style(self):
         """设置应用样式"""
@@ -594,33 +668,11 @@ class CameraCalibrationWindow(QMainWindow):
         board_type = self.board_type_combo.currentData()
         
         if board_type == "chessboard":
-            tips = """
-            <b>棋盘格标定板提示：</b><br>
-            • 确保棋盘格打印精确，无变形<br>
-            • 标定板应固定在坚硬平面上，避免弯曲<br>
-            • 拍摄时覆盖相机视场的不同区域（特别是边角）<br>
-            • 以不同角度（约15-45度）拍摄至少10张图像<br>
-            • 避免强反光和不均匀光照<br>
-            • 标定点为内部角点，比如一个8x6的棋盘格有7x5个内角点
-            """
+            tips = """<b>提示：</b>确保打印精确无变形，拍摄时覆盖视场不同区域（特别是边角），以不同角度拍摄至少10张图像，避免强反光。"""
         elif board_type == "circles":
-            tips = """
-            <b>圆形标定板提示：</b><br>
-            • 适用于光照条件不理想的场景<br>
-            • 圆点大小应适中，过大或过小都会影响检测<br>
-            • 拍摄时避免极端视角，防止圆变成椭圆影响检测<br>
-            • 确保光照均匀，减少阴影<br>
-            • 对于光滑表面，考虑使用哑光材料打印以减少反光
-            """
+            tips = """<b>提示：</b>适用于光照不理想场景，圆点大小应适中，避免极端视角，确保光照均匀，减少阴影。"""
         else:  # ring_circles
-            tips = """
-            <b>空心圆环标定板提示：</b><br>
-            • 最适合强光或反光条件下使用<br>
-            • 圆环厚度应适中，太细可能检测不到<br>
-            • 可以在白纸上用黑色记号笔手绘，确保圆环闭合<br>
-            • 特别适合玻璃表面或有反光的场景<br>
-            • 保持圆环形状规则，避免变形
-            """
+            tips = """<b>提示：</b>适合强光或反光条件，圆环厚度应适中，保持形状规则，特别适合玻璃表面或反光场景。"""
         
         self.board_tips_label.setText(tips)
     
@@ -663,15 +715,27 @@ class CameraCalibrationWindow(QMainWindow):
         # 如果没有找到图像
         if not image_files:
             QMessageBox.warning(self, "警告", "所选文件夹中未找到图像文件")
+            self.image_count_label.setText("(0 张)")
             return
             
         # 按文件名排序
         image_files.sort()
         
-        # 添加到列表
+        # 更新图像计数
+        self.image_count_label.setText(f"({len(image_files)} 张)")
+        
+        # 添加到列表（带缩略图）
         for img_file in image_files:
-            item = QListWidgetItem(os.path.basename(img_file))
+            # 创建缩略图
+            pixmap = QPixmap(img_file)
+            if not pixmap.isNull():
+                icon = QIcon(pixmap.scaled(80, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                icon = QIcon()
+            
+            item = QListWidgetItem(icon, "")  # 不显示文件名文本
             item.setData(Qt.UserRole, img_file)  # 存储完整路径
+            item.setToolTip(os.path.basename(img_file))  # 悬停显示文件名
             self.images_list.addItem(item)
             
         # 显示第一张图像

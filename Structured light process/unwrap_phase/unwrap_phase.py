@@ -9,9 +9,34 @@ import argparse
 import os
 from typing import List, Dict, Tuple, Optional
 from enum import Enum
+from dataclasses import dataclass
 import glob
 from skimage import morphology
 import skimage.filters as filters
+
+# 导入掩膜生成模块
+try:
+    from .Mask_generation import (
+        PhaseShiftingAlgorithm,
+        generate_projection_mask,
+        get_or_create_mask,
+        save_mask_visualization,
+        load_mask_from_file
+    )
+except ImportError:
+    # 如果相对导入失败，尝试绝对导入（用于直接运行此文件）
+    import sys
+    import os
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from Mask_generation import (
+        PhaseShiftingAlgorithm,
+        generate_projection_mask,
+        get_or_create_mask,
+        save_mask_visualization,
+        load_mask_from_file
+    )
 
 # 尝试设置中文字体
 try:
@@ -29,11 +54,33 @@ except:
 plt.rcParams['axes.unicode_minus'] = False
 
 
-class PhaseShiftingAlgorithm(Enum):
-    """相移算法类型枚举"""
-    three_step = 0      # 三步相移
-    four_step = 1       # 四步相移
-    n_step = 2          # N步相移
+@dataclass
+class UnwrapConfig:
+    """相位解包裹配置参数"""
+    gradient_weight: float = 0.3  # 相位梯度权重（0-1），越小对高梯度区域惩罚越小
+    base_threshold: float = np.pi * 2.5  # 基础相位跳跃阈值
+    dynamic_threshold_factor: float = 3.0  # 动态阈值的标准差系数
+    use_4_neighbors: bool = True  # 是否使用4邻域（False则使用8邻域）
+    
+    @classmethod
+    def for_algorithm(cls, algorithm: PhaseShiftingAlgorithm) -> 'UnwrapConfig':
+        """根据相移算法类型返回推荐配置"""
+        if algorithm == PhaseShiftingAlgorithm.three_step:
+            # 三步相移：信噪比较低，使用更宽松的参数
+            return cls(
+                gradient_weight=0.3,
+                base_threshold=np.pi * 2.5,
+                dynamic_threshold_factor=3.0,
+                use_4_neighbors=True
+            )
+        else:
+            # 四步及以上：信噪比较高，可以使用更严格的参数
+            return cls(
+                gradient_weight=0.5,
+                base_threshold=np.pi * 1.8,
+                dynamic_threshold_factor=2.0,
+                use_4_neighbors=False
+            )
 
 
 def compute_phasor_and_phase_masked(images: List[np.ndarray], mask: np.ndarray, algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step) -> Tuple[np.ndarray, np.ndarray]:
@@ -144,294 +191,48 @@ def compute_phasor_and_phase(images: List[np.ndarray], algorithm: PhaseShiftingA
     return wrapped_phase, phasor
 
 
-def compute_amplitude_from_images(images: List[np.ndarray], algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step) -> np.ndarray:
+def visualize_wrapped_phase(wrapped_phase: np.ndarray, quality_map: Optional[np.ndarray] = None, 
+                           title: str = "Wrapped Phase", save_path: Optional[str] = None,
+                           show_plots: bool = True):
     """
-    从相移图像计算振幅（调制度），用于生成投影区域掩膜
+    可视化包裹相位图
     
     参数:
-        images: 相移图像列表
-        algorithm: 相移算法类型
-    
-    返回:
-        amplitude: 振幅图，值越大表示投影强度越高
+        wrapped_phase: 包裹相位图
+        quality_map: 相位质量图 (可选)
+        title: 图像标题
+        save_path: 保存路径 (可选)
+        show_plots: 是否显示图形 (在线程中应设为False)
     """
-    if len(images) < 3:
-        raise ValueError(f"相移图像数量不足。至少需要3张图像，但只提供了{len(images)}张。")
+    plt.figure(figsize=(12, 9))
     
-    float_images = [img.astype(np.float32) for img in images]
-    n = len(float_images)
+    # 如果有质量图，创建一个2x1的子图
+    if quality_map is not None:
+        plt.subplot(2, 1, 1)
     
-    # 计算振幅（调制度）
-    if algorithm == PhaseShiftingAlgorithm.three_step:
-        I1, I2, I3 = float_images[0], float_images[1], float_images[2]
-        # 三步相移的振幅计算
-        sin_sum = (np.sqrt(3)/2) * (I2 - I3)
-        cos_sum = I1 - 0.5 * (I2 + I3)
-    elif algorithm == PhaseShiftingAlgorithm.four_step:
-        I1, I2, I3, I4 = float_images[0], float_images[1], float_images[2], float_images[3]
-        # 四步相移的振幅计算
-        sin_sum = I2 - I4
-        cos_sum = I1 - I3
-    elif algorithm == PhaseShiftingAlgorithm.n_step:
-        delta = 2 * np.pi / n
-        sin_sum = sum(float_images[i] * np.sin(i * delta) for i in range(n))
-        cos_sum = sum(float_images[i] * np.cos(i * delta) for i in range(n))
+    # 显示包裹相位
+    phase_img = plt.imshow(wrapped_phase, cmap='jet')
+    plt.colorbar(phase_img, label='Phase (rad)')
+    plt.title(title)
+    
+    # 如果有质量图，在第二个子图中显示
+    if quality_map is not None:
+        plt.subplot(2, 1, 2)
+        quality_img = plt.imshow(quality_map, cmap='viridis')
+        plt.colorbar(quality_img, label='Quality (Modulation/Mean)')
+        plt.title("Phase Quality Map")
+    
+    plt.tight_layout()
+    
+    # 如果指定了保存路径，保存图像
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    # 只有在主线程中且需要显示时才调用plt.show()
+    if show_plots:
+        plt.show()
     else:
-        raise ValueError(f"不支持的相移算法: {algorithm}")
-    
-    # 计算振幅（调制度）
-    amplitude = np.sqrt(sin_sum**2 + cos_sum**2) * (2 / n)
-    
-    return amplitude
-
-
-def generate_projection_mask(images: List[np.ndarray], 
-                           algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
-                          method: str = 'adaptive', 
-                           thresh_rel: Optional[float] = None, 
-                           min_area: int = 500,
-                           confidence: float = 0.5,
-                           border_trim_px: int = 10) -> np.ndarray:
-    """
-    基于相移图像生成投影区域掩膜，用于区分投影区域和背景
-    改进版本：增加了自适应阈值化、噪声抑制、智能边界处理等功能
-    
-    参数:
-        images: 相移图像列表
-        algorithm: 相移算法类型
-        method: 阈值化方法 ('otsu', 'relative', 'adaptive')
-        thresh_rel: 相对阈值（仅用于relative方法）
-        min_area: 最小连通区域面积
-        confidence: 掩膜置信度阈值 (0.1-0.9)，控制掩膜的严格程度
-        border_trim_px: 边界收缩像素数
-    
-    返回:
-        mask: 二值掩膜，True表示投影区域
-    """
-    if len(images) < 3:
-        raise ValueError(f"至少需要3张图像，但只提供了{len(images)}张")
-    
-    # 计算基础特征
-    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
-    I_max = np.max(imgs, axis=2)
-    I_min = np.min(imgs, axis=2)
-    I_mean = np.mean(imgs, axis=2)
-    I_std = np.std(imgs, axis=2)
-
-    # 基本特征计算
-    A = (I_max - I_min) / 2.0  # 振幅
-    M = (I_max - I_min) / (I_max + I_min + 1e-9)  # 调制度
-    
-    # 新增特征：相位稳定性（基于标准差）
-    S = I_std / (I_mean + 1e-9)  # 归一化标准差，反映相位稳定性
-    
-    # 噪声检测和抑制
-    A, M, S = _apply_noise_reduction(A, M, S, I_mean)
-    
-    # 归一化特征
-    A_norm = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    M_norm = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    S_norm = cv2.normalize(S, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    I_norm = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    
-    # 选择阈值化方法
-    if method == 'adaptive':
-        mask = _adaptive_thresholding(A_norm, M_norm, S_norm, I_norm, confidence)
-    elif method == 'otsu':
-        mask = _otsu_thresholding(A_norm, M_norm, I_norm)
-    elif method == 'relative':
-        mask = _relative_thresholding(A_norm, M_norm, I_norm, thresh_rel, confidence)
-    else:
-        raise ValueError(f"不支持的阈值化方法: {method}")
-    
-    print(f"掩膜生成参数: 方法={method}, 置信度={confidence:.2f}")
-    
-    # 渐进式形态学处理
-    mask = _progressive_morphological_processing(mask, min_area)
-    
-    # 智能边界处理
-    mask = _smart_border_trimming(mask, border_trim_px)
-    
-    # 连通性分析和优化
-    mask = _connectivity_optimization(mask)
-    
-    return mask.astype(bool)
-
-
-def _apply_noise_reduction(A, M, S, I_mean):
-    """应用噪声抑制"""
-    # 使用高斯滤波减少噪声
-    A_filtered = cv2.GaussianBlur(A, (5, 5), 1.0)
-    M_filtered = cv2.GaussianBlur(M, (5, 5), 1.0)
-    S_filtered = cv2.GaussianBlur(S, (5, 5), 1.0)
-    
-    # 检测异常高的噪声区域
-    noise_mask = (S > np.percentile(S, 95)) & (I_mean < np.percentile(I_mean, 20))
-    
-    # 在噪声区域使用滤波后的值
-    A = np.where(noise_mask, A_filtered, A)
-    M = np.where(noise_mask, M_filtered, M)
-    S = np.where(noise_mask, S_filtered, S)
-    
-    return A, M, S
-
-
-def _adaptive_thresholding(A_norm, M_norm, S_norm, I_norm, confidence):
-    """自适应阈值化方法"""
-    # 计算每个特征的多级阈值
-    th_A_low = np.percentile(A_norm[A_norm > 0], 25)  # 降低阈值
-    th_A_high = np.percentile(A_norm[A_norm > 0], 60) # 降低阈值
-    
-    th_M_low = np.percentile(M_norm[M_norm > 0], 25)  # 降低阈值
-    th_M_high = np.percentile(M_norm[M_norm > 0], 60) # 降低阈值
-    
-    th_I = np.percentile(I_norm, 40)  # 降低强度阈值
-    
-    # 稳定性阈值（修复：使用更宽松的稳定性约束）
-    th_S = np.percentile(S_norm, 75)  # 提高阈值，允许更多区域通过
-    
-    # 多级判断（修复：移除过于严格的稳定性约束）
-    # 高置信度区域：振幅和调制度都高，稳定性约束更宽松
-    high_confidence = (A_norm >= th_A_high) & (M_norm >= th_M_high)
-    
-    # 中等置信度区域：振幅或调制度高，加入稳定性约束但更宽松
-    medium_confidence = ((A_norm >= th_A_low) | (M_norm >= th_M_low)) & (S_norm <= th_S)
-    
-    # 低置信度区域：仅基于振幅或调制度
-    low_confidence = (A_norm >= th_A_low) | (M_norm >= th_M_low)
-    
-    # 强度约束
-    intensity_valid = I_norm > th_I
-    
-    # 根据置信度参数选择区域（修复：简化逻辑，主要基于振幅和调制度）
-    if confidence >= 0.8:
-        # 最严格：只要高振幅和高调制度
-        mask = high_confidence & intensity_valid
-    elif confidence >= 0.6:
-        # 严格：高置信度区域为主
-        mask = high_confidence & intensity_valid
-    elif confidence >= 0.4:
-        # 中等：高置信度区域 + 部分中等置信度区域
-        mask = (high_confidence | (medium_confidence & (A_norm >= th_A_high * 0.8))) & intensity_valid
-    elif confidence >= 0.2:
-        # 宽松：包含更多中等置信度区域
-        mask = (high_confidence | medium_confidence) & intensity_valid
-    else:
-        # 最宽松：主要基于振幅和调制度，忽略稳定性
-        mask = low_confidence & intensity_valid
-    
-    return mask
-
-
-def _otsu_thresholding(A_norm, M_norm, I_norm):
-    """改进的Otsu方法"""
-    _, mask_A = cv2.threshold(A_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, mask_M = cv2.threshold(M_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 降低强度阈值，使更多区域通过
-    th_I = np.percentile(I_norm, 30)  # 从50降低到30
-    mask_I = (I_norm > th_I).astype(np.uint8) * 255
-    
-    mask = np.logical_or(mask_A > 0, mask_M > 0)
-    mask = np.logical_and(mask, mask_I > 0)
-    
-    return mask
-
-
-def _relative_thresholding(A_norm, M_norm, I_norm, thresh_rel, confidence):
-    """改进的相对阈值方法"""
-    if thresh_rel is None:
-        thresh_rel = 0.3  # 提高默认阈值，使掩码更宽松
-    
-    # 调整相对阈值计算，使其更宽松
-    adjusted_thresh_rel = float(thresh_rel) * (2.5 - float(confidence))  # 增加系数
-    th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
-    th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
-    th_I = np.percentile(I_norm, 30)  # 降低强度阈值
-    
-    mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
-    mask = np.logical_and(mask, I_norm > th_I)
-    
-    return mask
-
-
-def _progressive_morphological_processing(mask, min_area):
-    """渐进式形态学处理"""
-    mask = mask.astype(np.uint8)
-    
-    # 更温和的形态学处理
-    # 小尺度闭运算
-    mask = morphology.binary_closing(mask, morphology.disk(2))  # 减小核大小
-    
-    # 移除超小对象（更宽松）
-    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//8)  # 更小的阈值
-    
-    # 中等尺度闭运算
-    mask = morphology.binary_closing(mask, morphology.disk(3))  # 减小核大小
-    
-    # 填充小孔洞（更宽松）
-    mask = morphology.remove_small_holes(mask, area_threshold=min_area//4)  # 更小的阈值
-    
-    # 最终移除小对象（更宽松）
-    mask = morphology.remove_small_objects(mask, min_size=min_area//2)  # 更小的阈值
-    
-    return mask.astype(np.uint8)
-
-
-def _smart_border_trimming(mask, border_trim_px):
-    """智能边界处理"""
-    if not border_trim_px or border_trim_px <= 0:
-        return mask
-    
-    h, w = mask.shape
-    bt = min(border_trim_px, min(h // 15, w // 15))  # 更保守的边界收缩
-    
-    if bt > 0:
-        # 只在边界区域确实存在噪声时才进行收缩
-        border_noise_ratio = 0.1  # 边界噪声比例阈值
-        
-        # 检查上下边界
-        top_ratio = np.mean(mask[:bt, :])
-        bottom_ratio = np.mean(mask[-bt:, :])
-        left_ratio = np.mean(mask[:, :bt])
-        right_ratio = np.mean(mask[:, -bt:])
-        
-        if top_ratio < border_noise_ratio:
-            mask[:bt, :] = 0
-        if bottom_ratio < border_noise_ratio:
-            mask[-bt:, :] = 0
-        if left_ratio < border_noise_ratio:
-            mask[:, :bt] = 0
-        if right_ratio < border_noise_ratio:
-            mask[:, -bt:] = 0
-    
-    return mask
-
-
-def _connectivity_optimization(mask):
-    """连通性优化"""
-    # 保留最大的几个连通分量
-    num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
-    
-    if num_labels <= 2:  # 背景 + 1个前景
-        return mask
-    
-    # 计算每个连通分量的面积
-    areas = [(labels == i).sum() for i in range(1, num_labels)]
-    
-    if len(areas) == 0:
-        return mask
-    
-    # 保留最大的连通分量，以及面积超过最大面积30%的其他分量
-    max_area = max(areas)
-    area_threshold = max_area * 0.3
-    
-    new_mask = np.zeros_like(mask)
-    for i, area in enumerate(areas):
-        if area >= area_threshold:
-            new_mask[labels == (i + 1)] = 1
-    
-    return new_mask.astype(np.uint8)
+        plt.close()
 
 
 def compute_phase_quality_masked(images: List[np.ndarray], mask: np.ndarray) -> np.ndarray:
@@ -526,64 +327,32 @@ def compute_phase_quality(images: List[np.ndarray]) -> np.ndarray:
     return quality_map
 
 
-def visualize_wrapped_phase(wrapped_phase: np.ndarray, quality_map: Optional[np.ndarray] = None, 
-                           title: str = "Wrapped Phase", save_path: Optional[str] = None,
-                           show_plots: bool = True):
+def quality_guided_unwrap(
+    wrapped_phase: np.ndarray, 
+    quality_map: np.ndarray, 
+    mask: Optional[np.ndarray] = None,
+    config: Optional[UnwrapConfig] = None
+) -> np.ndarray:
     """
-    可视化包裹相位图
+    统一的质量引导相位解包裹算法
+    
+    这是唯一的解包裹函数，通过配置参数适配不同的相移算法。
+    包裹相位就是包裹相位（范围[-π,π]），解包裹算法不应该关心它来自几步相移。
     
     参数:
-        wrapped_phase: 包裹相位图
-        quality_map: 相位质量图 (可选)
-        title: 图像标题
-        save_path: 保存路径 (可选)
-        show_plots: 是否显示图形 (在线程中应设为False)
-    """
-    plt.figure(figsize=(12, 9))
-    
-    # 如果有质量图，创建一个2x1的子图
-    if quality_map is not None:
-        plt.subplot(2, 1, 1)
-    
-    # 显示包裹相位
-    phase_img = plt.imshow(wrapped_phase, cmap='jet')
-    plt.colorbar(phase_img, label='Phase (rad)')
-    plt.title(title)
-    
-    # 如果有质量图，在第二个子图中显示
-    if quality_map is not None:
-        plt.subplot(2, 1, 2)
-        quality_img = plt.imshow(quality_map, cmap='viridis')
-        plt.colorbar(quality_img, label='Quality (Modulation/Mean)')
-        plt.title("Phase Quality Map")
-    
-    plt.tight_layout()
-    
-    # 如果指定了保存路径，保存图像
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
-    # 只有在主线程中且需要显示时才调用plt.show()
-    if show_plots:
-        plt.show()
-    else:
-        plt.close()
-
-
-def quality_guided_unwrap_with_strict_mask(wrapped_phase: np.ndarray, quality_map: np.ndarray, is_three_step: bool = False, mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    使用严格掩膜约束的质量引导解包裹算法，确保只在掩膜区域内进行解包裹
-    
-    参数:
-        wrapped_phase: 包裹相位图
+        wrapped_phase: 包裹相位图（范围 [-π, π]）
         quality_map: 相位质量图，值越大表示质量越高
-        is_three_step: 是否为三步相移算法数据
-        mask: 投影区域掩膜，True表示需要解包裹的区域
+        mask: 投影区域掩膜，True表示需要解包裹的区域（可选）
+        config: 解包裹配置参数（可选，默认使用标准配置）
     
     返回:
         unwrapped_phase: 解包裹后的相位图，掩膜外区域为0
     """
     import heapq
+    
+    # 使用默认配置（如果未提供）
+    if config is None:
+        config = UnwrapConfig()
     
     # 图像尺寸
     height, width = wrapped_phase.shape
@@ -603,25 +372,22 @@ def quality_guided_unwrap_with_strict_mask(wrapped_phase: np.ndarray, quality_ma
     # 创建输出的解包裹相位图，初始化为0
     unwrapped_phase = np.zeros_like(wrapped_phase)
     
-    # 在掩膜外的区域保持为0（黑色）
-    # 掩膜内的区域将在后续处理中填充
-    
-    # 计算相位梯度，用于检测相位跳跃和增强质量图
+    # 计算相位梯度，用于增强质量图
     grad_y, grad_x = np.gradient(wrapped_phase)
     phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
     
     # 增强质量图：结合原始质量图和相位梯度
-    # 只在掩膜区域内计算增强质量图
+    # 使用配置的gradient_weight来控制对高梯度区域的惩罚力度
     enhanced_quality = np.zeros_like(quality_map)
     if np.any(mask):
         mask_grad = phase_gradient_magnitude[mask]
         if np.max(mask_grad) > 0:
-            if is_three_step:
-                # 对于三步相移，更强调相位连续性
-                enhanced_quality[mask] = quality_map[mask] * (1 + 0.8 * (1 - phase_gradient_magnitude[mask] / np.max(mask_grad)))
-            else:
-                # 对于其他相移算法，保持原有质量图
-                enhanced_quality[mask] = quality_map[mask]
+            # 统一的质量增强策略，通过config.gradient_weight参数控制
+            enhanced_quality[mask] = quality_map[mask] * (
+                1 + config.gradient_weight * (1 - phase_gradient_magnitude[mask] / np.max(mask_grad))
+            )
+        else:
+            enhanced_quality[mask] = quality_map[mask]
     
     # 创建质量排序索引，只考虑掩膜内的像素
     mask_indices = np.where(mask)
@@ -644,28 +410,20 @@ def quality_guided_unwrap_with_strict_mask(wrapped_phase: np.ndarray, quality_ma
     # 使用优先队列（堆）进行质量引导的解包裹
     heap = [(-enhanced_quality[seed_y, seed_x], seed_y, seed_x, unwrapped_phase[seed_y, seed_x])]
     
-    # 定义邻域方向
-    if is_three_step:
-        # 对于三步相移，使用4邻域以减少噪声传播
+    # 定义邻域方向（根据配置）
+    if config.use_4_neighbors:
+        # 4邻域：更稳定，适合低信噪比
         directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
     else:
-        # 对于其他相移算法，使用8邻域
+        # 8邻域：更连通，适合高信噪比
         directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
     
-    # 相位跳跃阈值
-    if is_three_step:
-        # 对于三步相移算法，使用更宽松的阈值
-        phase_jump_threshold = np.pi * 1.8
-        # 计算动态阈值：基于相位梯度的中值和标准差
-        median_grad = np.median(phase_gradient_magnitude[mask])
-        std_grad = np.std(phase_gradient_magnitude[mask])
-        dynamic_threshold = min(np.pi * 1.8, median_grad + 2 * std_grad)
-        # 使用动态阈值和固定阈值的较小值
-        phase_jump_threshold = min(phase_jump_threshold, dynamic_threshold)
-        print(f"三步相移算法使用动态相位跳跃阈值: {phase_jump_threshold:.3f} rad")
-    else:
-        # 对于其他相移算法，使用标准阈值
-        phase_jump_threshold = np.pi * 1.5
+    # 计算相位跳跃阈值（基于配置和数据统计）
+    median_grad = np.median(phase_gradient_magnitude[mask])
+    std_grad = np.std(phase_gradient_magnitude[mask])
+    dynamic_threshold = median_grad + config.dynamic_threshold_factor * std_grad
+    phase_jump_threshold = max(config.base_threshold, dynamic_threshold)
+    print(f"解包裹相位跳跃阈值: {phase_jump_threshold:.3f} rad")
     
     while heap:
         neg_quality, y, x, current_phase = heapq.heappop(heap)
@@ -725,1432 +483,13 @@ def quality_guided_unwrap_with_strict_mask(wrapped_phase: np.ndarray, quality_ma
     return unwrapped_phase
 
 
-def quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray, is_three_step: bool = False, mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    使用改进的质量引导解包裹算法，更好地保留物体的高度调制信息。
-    针对三步相移算法进行了特殊优化。
-    
-    参数:
-        wrapped_phase: 包裹相位图
-        quality_map: 相位质量图，值越大表示质量越高
-        is_three_step: 是否为三步相移算法数据
-        mask: 投影区域掩膜，True表示需要解包裹的区域
-    
-    返回:
-        unwrapped_phase: 解包裹后的相位图
-    """
-    import heapq
-    
-    # 图像尺寸
-    height, width = wrapped_phase.shape
-    
-    # 如果没有提供掩膜，创建一个全True的掩膜
-    if mask is None:
-        mask = np.ones((height, width), dtype=bool)
-    else:
-        # 确保掩膜是布尔类型且尺寸匹配
-        mask = mask.astype(bool)
-        if mask.shape != (height, width):
-            raise ValueError(f"掩膜尺寸 {mask.shape} 与相位图尺寸 {(height, width)} 不匹配")
-    
-    # 创建访问标记数组
-    visited = np.zeros((height, width), dtype=bool)
-    
-    # 创建输出的解包裹相位图
-    unwrapped_phase = np.zeros_like(wrapped_phase)
-    
-    # 在掩膜外的区域设置为0，表示无效区域（后续会处理为黑色）
-    unwrapped_phase[~mask] = 0
-    
-    # 计算相位梯度，用于检测相位跳跃和增强质量图
-    grad_y, grad_x = np.gradient(wrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 增强质量图：结合原始质量图和相位梯度
-    # 只在掩膜区域内计算增强质量图
-    enhanced_quality = quality_map.copy()
-    if np.any(mask):
-        mask_grad = phase_gradient_magnitude[mask]
-        if np.max(mask_grad) > 0:
-            if is_three_step:
-                # 对于三步相移，更强调相位连续性
-                enhanced_quality[mask] = quality_map[mask] * (
-                    1 + 0.8 * (1 - phase_gradient_magnitude[mask] / np.max(mask_grad))
-                )
-            else:
-                # 对于其他相移算法，保持原有质量图
-                enhanced_quality[mask] = quality_map[mask]
-    
-    # 在掩膜外的区域设置质量为0
-    enhanced_quality[~mask] = 0
-    
-    # 创建质量排序索引
-    quality_flat = enhanced_quality.flatten()
-    indices = np.argsort(-quality_flat)  # 按质量降序排序的索引
-    
-    # 找到掩膜区域内质量最高的点作为种子点
-    valid_indices = []
-    for idx in indices:
-        y, x = np.unravel_index(idx, (height, width))
-        if mask[y, x]:
-            valid_indices.append(idx)
-            break
-    
-    if not valid_indices:
-        print("警告：掩膜区域内没有有效的种子点，返回原始包裹相位")
-        return wrapped_phase.copy()
-    
-    seed_idx = valid_indices[0]
-    seed_y, seed_x = np.unravel_index(seed_idx, (height, width))
-    
-    # 标记种子点为已访问
-    visited[seed_y, seed_x] = True
-    unwrapped_phase[seed_y, seed_x] = wrapped_phase[seed_y, seed_x]
-    
-    # 使用优先队列（堆）进行质量引导的解包裹
-    # 队列元素：(负质量值, y, x, 当前相位值)
-    # 使用负质量值是因为heapq是最小堆
-    heap = [(-enhanced_quality[seed_y, seed_x], seed_y, seed_x, unwrapped_phase[seed_y, seed_x])]
-    
-    # 定义邻域方向
-    if is_three_step:
-        # 对于三步相移，使用4邻域以减少噪声传播
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    else:
-        # 对于其他相移算法，使用8邻域
-        directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-    
-    # 相位跳跃阈值
-    if is_three_step:
-        # 对于三步相移算法，使用更宽松的阈值
-        phase_jump_threshold = np.pi * 1.8
-        # 计算动态阈值：基于相位梯度的中值和标准差
-        median_grad = np.median(phase_gradient_magnitude)
-        std_grad = np.std(phase_gradient_magnitude)
-        dynamic_threshold = min(np.pi * 1.8, median_grad + 2 * std_grad)
-        # 使用动态阈值和固定阈值的较小值
-        phase_jump_threshold = min(phase_jump_threshold, dynamic_threshold)
-        print(f"三步相移算法使用动态相位跳跃阈值: {phase_jump_threshold:.3f} rad")
-    else:
-        # 对于其他相移算法，使用标准阈值
-        phase_jump_threshold = np.pi * 1.5
-    
-    while heap:
-        neg_quality, y, x, current_phase = heapq.heappop(heap)
-        
-        # 对当前点的8个邻域进行检查
-        for dy, dx in directions:
-            ny, nx = y + dy, x + dx
-                
-            # 检查边界
-            if ny < 0 or ny >= height or nx < 0 or nx >= width:
-                continue
-                
-            # 如果邻域点未访问
-            if not visited[ny, nx]:
-                # 计算包裹相位差异
-                wrapped_diff = wrapped_phase[ny, nx] - wrapped_phase[y, x]
-                
-                # 将相位差异调整到 [-π, π] 范围
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 计算可能的解包裹相位值
-                candidate_phase = current_phase + wrapped_diff
-                
-                # 检查相位跳跃是否合理
-                phase_jump = abs(candidate_phase - current_phase)
-                if phase_jump > phase_jump_threshold:
-                    # 如果相位跳跃过大，尝试添加或减去2π的整数倍
-                    k = round((candidate_phase - current_phase) / (2 * np.pi))
-                    candidate_phase = current_phase + wrapped_diff - k * 2 * np.pi
-                
-                # 计算新的相位跳跃
-                new_phase_jump = abs(candidate_phase - current_phase)
-                
-                # 如果相位跳跃仍然过大，跳过这个点
-                if new_phase_jump > phase_jump_threshold:
-                    continue
-                
-                # 设置解包裹相位
-                unwrapped_phase[ny, nx] = candidate_phase
-                
-                # 标记为已访问
-                visited[ny, nx] = True
-                
-                # 添加到优先队列
-                heapq.heappush(heap, (-enhanced_quality[ny, nx], ny, nx, candidate_phase))
-    
-    # 对于三步相移，进行后处理以提高质量
-    if is_three_step:
-        # 检测并修复剩余的相位跳跃
-        grad_y, grad_x = np.gradient(unwrapped_phase)
-        phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-        
-        # 检测异常大的梯度
-        median_grad = np.median(phase_gradient_magnitude)
-        mad = np.median(np.abs(phase_gradient_magnitude - median_grad))
-        threshold = median_grad + 3 * mad
-        
-        jump_mask = phase_gradient_magnitude > threshold
-        
-        if np.any(jump_mask):
-            print(f"检测到 {np.sum(jump_mask)} 个相位跳跃点，进行修复...")
-            # 对跳跃点进行局部中值滤波
-            from scipy.ndimage import median_filter
-            # 创建一个临时数组，只对跳跃点进行滤波
-            temp = unwrapped_phase.copy()
-            temp[jump_mask] = median_filter(unwrapped_phase, size=5)[jump_mask]
-            unwrapped_phase = temp
-        
-        # 应用轻微的高斯滤波以平滑结果
-        from scipy.ndimage import gaussian_filter
-        unwrapped_phase = gaussian_filter(unwrapped_phase, sigma=0.8)
-    
-    # 对于三步相移，进行后处理以提高质量
-    if is_three_step:
-        # 检测并修复剩余的相位跳跃
-        grad_y, grad_x = np.gradient(unwrapped_phase)
-        phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-        
-        # 检测异常大的梯度
-        median_grad = np.median(phase_gradient_magnitude)
-        mad = np.median(np.abs(phase_gradient_magnitude - median_grad))
-        threshold = median_grad + 3 * mad
-        
-        jump_mask = phase_gradient_magnitude > threshold
-        
-        if np.any(jump_mask):
-            print(f"检测到 {np.sum(jump_mask)} 个相位跳跃点，进行修复...")
-            # 对跳跃点进行局部中值滤波
-            from scipy.ndimage import median_filter
-            # 创建一个临时数组，只对跳跃点进行滤波
-            temp = unwrapped_phase.copy()
-            temp[jump_mask] = median_filter(unwrapped_phase, size=5)[jump_mask]
-            unwrapped_phase = temp
-        
-        # 应用轻微的高斯滤波以平滑结果
-        from scipy.ndimage import gaussian_filter
-        unwrapped_phase = gaussian_filter(unwrapped_phase, sigma=0.8)
-    
-    # 对于三步相移，进行后处理以提高质量
-    if is_three_step:
-        # 检测并修复剩余的相位跳跃
-        grad_y, grad_x = np.gradient(unwrapped_phase)
-        phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-        
-        # 检测异常大的梯度
-        median_grad = np.median(phase_gradient_magnitude)
-        mad = np.median(np.abs(phase_gradient_magnitude - median_grad))
-        threshold = median_grad + 3 * mad
-        
-        jump_mask = phase_gradient_magnitude > threshold
-        
-        if np.any(jump_mask):
-            print(f"检测到 {np.sum(jump_mask)} 个相位跳跃点，进行修复...")
-            # 对跳跃点进行局部中值滤波
-            from scipy.ndimage import median_filter
-            # 创建一个临时数组，只对跳跃点进行滤波
-            temp = unwrapped_phase.copy()
-            temp[jump_mask] = median_filter(unwrapped_phase, size=5)[jump_mask]
-            unwrapped_phase = temp
-        
-        # 应用轻微的高斯滤波以平滑结果
-        from scipy.ndimage import gaussian_filter
-        unwrapped_phase = gaussian_filter(unwrapped_phase, sigma=0.8)
-    
-    return unwrapped_phase
-
-
-def improved_quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray, is_three_step: bool = False, mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    使用更高级的质量引导解包裹算法，专门针对保留高度调制信息进行优化。
-    此版本结合了相位梯度和相位跳跃来生成更可靠的质量图，并使用稳健的相位跳跃校正方法。
-    
-    参数:
-        wrapped_phase: 包裹相位图
-        quality_map: 相位质量图，值越大表示质量越高
-        is_three_step: 是否为三步相移算法数据
-        mask: 投影区域掩膜，True表示需要解包裹的区域
-
-    返回:
-        unwrapped_phase: 解包裹后的相位图
-    """
-    import heapq
-    
-    # 图像尺寸
-    height, width = wrapped_phase.shape
-    
-    # 创建访问标记和解包裹相位数组
-    visited = np.zeros((height, width), dtype=bool)
-    unwrapped_phase = np.zeros_like(wrapped_phase)
-    
-    # 1. 计算相位梯度
-    grad_y, grad_x = np.gradient(wrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 2. 检测相位跳跃
-    phase_jumps = np.zeros_like(wrapped_phase)
-    for y in range(height - 1):
-        for x in range(width - 1):
-            diff_h = wrapped_phase[y, x+1] - wrapped_phase[y, x]
-            phase_jumps[y, x] += abs(np.mod(diff_h + np.pi, 2 * np.pi) - np.pi)
-            diff_v = wrapped_phase[y+1, x] - wrapped_phase[y, x]
-            phase_jumps[y, x] += abs(np.mod(diff_v + np.pi, 2 * np.pi) - np.pi)
-
-    # 3. 增强质量图: 结合原始质量、相位梯度和相位跳跃（仅掩膜内）
-    max_grad = np.max(phase_gradient_magnitude)
-    if mask is None:
-        grad_term = (1 - phase_gradient_magnitude / max_grad) if max_grad > 0 else np.ones_like(quality_map)
-    else:
-        grad_term = np.zeros_like(quality_map)
-        if max_grad > 0:
-            grad_term[mask] = 1 - (phase_gradient_magnitude[mask] / max_grad)
-    
-    max_jumps = np.max(phase_jumps)
-    if mask is None:
-        jump_term = (1 - phase_jumps / max_jumps) if max_jumps > 0 else np.ones_like(quality_map)
-    else:
-        jump_term = np.zeros_like(quality_map)
-        if max_jumps > 0:
-            jump_term[mask] = 1 - (phase_jumps[mask] / max_jumps)
-
-    if mask is None:
-        enhanced_quality = quality_map * (1 + 0.7 * grad_term) * (1 + 0.3 * jump_term)
-    else:
-        enhanced_quality = np.zeros_like(quality_map)
-        enhanced_quality[mask] = quality_map[mask] * (1 + 0.7 * grad_term[mask]) * (1 + 0.3 * jump_term[mask])
-    
-    # 4. 找到质量最高的点作为种子点
-    if mask is None:
-        seed_idx = np.argmax(enhanced_quality)
-        seed_y, seed_x = np.unravel_index(seed_idx, (height, width))
-    else:
-        inds = np.argwhere(mask)
-        if inds.size == 0:
-            return unwrapped_phase
-        sub = enhanced_quality[mask]
-        best = np.argmax(sub)
-        seed_y, seed_x = inds[best][0], inds[best][1]
-    
-    visited[seed_y, seed_x] = True
-    unwrapped_phase[seed_y, seed_x] = wrapped_phase[seed_y, seed_x]
-    
-    # 5. 使用优先队列进行质量引导的解包裹
-    heap = [(-enhanced_quality[seed_y, seed_x], seed_y, seed_x, unwrapped_phase[seed_y, seed_x])]
-    
-    # 6. 设置算法参数
-    if is_three_step:
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # 4邻域
-        median_grad = np.median(phase_gradient_magnitude)
-        std_grad = np.std(phase_gradient_magnitude)
-        phase_jump_threshold = min(np.pi * 1.8, median_grad + 2.5 * std_grad)
-        print(f"三步相移算法使用动态相位跳跃阈值: {phase_jump_threshold:.3f} rad")
-    else:
-        directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] # 8邻域
-        phase_jump_threshold = np.pi * 1.2
-
-    # 7. 主循环
-    while heap:
-        _, y, x, current_phase = heapq.heappop(heap)
-        
-        for dy, dx in directions:
-            ny, nx = y + dy, x + dx
-            
-            if 0 <= ny < height and 0 <= nx < width and not visited[ny, nx]:
-                if mask is not None and not mask[ny, nx]:
-                    continue
-                wrapped_diff = wrapped_phase[ny, nx] - wrapped_phase[y, x]
-                
-                k = -np.round(wrapped_diff / (2 * np.pi))
-                unwrapped_diff = wrapped_diff + k * 2 * np.pi
-
-                if abs(unwrapped_diff) > phase_jump_threshold:
-                    continue
-                
-                candidate_phase = current_phase + unwrapped_diff
-                unwrapped_phase[ny, nx] = candidate_phase
-                
-                visited[ny, nx] = True
-                heapq.heappush(heap, (-enhanced_quality[ny, nx], ny, nx, candidate_phase))
-    
-    if mask is not None:
-        unwrapped_phase[~mask] = 0
-    return unwrapped_phase
-
-
-def robust_phase_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray, is_three_step: bool = False, mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    使用鲁棒的相位解包裹算法，专门设计用于保留物体的高度调制信息。
-    
-    参数:
-        wrapped_phase: 包裹相位图
-        quality_map: 相位质量图，值越大表示质量越高
-    
-    返回:
-        unwrapped_phase: 解包裹后的相位图
-    """
-    import heapq
-    
-    # 图像尺寸
-    height, width = wrapped_phase.shape
-    
-    # 创建访问标记数组
-    visited = np.zeros((height, width), dtype=bool)
-    
-    # 创建输出的解包裹相位图
-    unwrapped_phase = np.zeros_like(wrapped_phase)
-    
-    # 计算相位梯度
-    grad_y, grad_x = np.gradient(wrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 检测相位跳跃：计算相邻像素的相位差异
-    phase_jumps = np.zeros_like(wrapped_phase)
-    for y in range(height-1):
-        for x in range(width-1):
-            # 水平方向相位跳跃
-            diff_h = wrapped_phase[y, x+1] - wrapped_phase[y, x]
-            diff_h = np.mod(diff_h + np.pi, 2 * np.pi) - np.pi
-            phase_jumps[y, x] += abs(diff_h)
-            
-            # 垂直方向相位跳跃
-            diff_v = wrapped_phase[y+1, x] - wrapped_phase[y, x]
-            diff_v = np.mod(diff_v + np.pi, 2 * np.pi) - np.pi
-            phase_jumps[y, x] += abs(diff_v)
-    
-    # 改进的质量图：结合原始质量图、相位梯度和相位跳跃
-    if is_three_step:
-        # 对于三步相移，更强调相位连续性
-        enhanced_quality = quality_map * (1 + 0.8 * (1 - phase_gradient_magnitude / np.max(phase_gradient_magnitude)))
-        # 对于三步相移，减少相位跳跃的影响
-        enhanced_quality = enhanced_quality * (1 + 0.1 * (1 - phase_jumps / np.max(phase_jumps)))
-    else:
-        # 对于其他相移算法，在相位变化大的区域给予更高的权重
-        enhanced_quality = quality_map * (1 + 0.3 * phase_gradient_magnitude / np.max(phase_gradient_magnitude))
-        enhanced_quality = enhanced_quality * (1 + 0.2 * phase_jumps / np.max(phase_jumps))
-    
-    # 在掩膜内找到质量最高的点作为种子点
-    if mask is not None:
-        enhanced_quality[~mask] = 0
-    seed_idx = np.argmax(enhanced_quality)
-    seed_y, seed_x = np.unravel_index(seed_idx, (height, width))
-    
-    # 标记种子点为已访问
-    visited[seed_y, seed_x] = True
-    unwrapped_phase[seed_y, seed_x] = wrapped_phase[seed_y, seed_x]
-    
-    # 使用优先队列（堆）进行质量引导的解包裹
-    heap = [(-enhanced_quality[seed_y, seed_x], seed_y, seed_x, unwrapped_phase[seed_y, seed_x])]
-    
-    # 定义邻域方向
-    if is_three_step:
-        # 对于三步相移，使用4邻域以减少噪声传播
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    else:
-        # 对于其他相移算法，使用8邻域以提高连通性
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    
-    # 设置相位跳跃阈值
-    if is_three_step:
-        # 对于三步相移，使用更宽松的阈值
-        # 计算相位梯度的统计特性
-        median_grad = np.median(phase_gradient_magnitude)
-        std_grad = np.std(phase_gradient_magnitude)
-        # 动态阈值：基于相位梯度的中值和标准差
-        phase_jump_threshold = np.pi * 2.0 + median_grad * 0.5
-        print(f"三步相移动态阈值: {phase_jump_threshold}")
-    else:
-        # 对于其他相移算法，使用标准阈值
-        phase_jump_threshold = np.pi * 1.2  # 相位跳跃阈值，可以根据需要调整
-    
-    while heap:
-        neg_quality, y, x, current_phase = heapq.heappop(heap)
-        
-        # 对当前点的4个邻域进行检查
-        for dy, dx in directions:
-            ny, nx = y + dy, x + dx
-                
-            # 检查边界
-            if ny < 0 or ny >= height or nx < 0 or nx >= width:
-                continue
-                
-            # 如果邻域点未访问
-            if not visited[ny, nx]:
-                if mask is not None and not mask[ny, nx]:
-                    continue
-                # 计算包裹相位差异
-                wrapped_diff = wrapped_phase[ny, nx] - wrapped_phase[y, x]
-                
-                # 将相位差异调整到 [-π, π] 范围
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 计算可能的解包裹相位值
-                candidate_phase = current_phase + wrapped_diff
-                
-                # 检查相位跳跃是否合理
-                phase_jump = abs(candidate_phase - current_phase)
-                
-                # 如果相位跳跃过大，尝试添加或减去2π的整数倍
-                if phase_jump > phase_jump_threshold:
-                    k = round((candidate_phase - current_phase) / (2 * np.pi))
-                    candidate_phase = current_phase + wrapped_diff - k * 2 * np.pi
-                    phase_jump = abs(candidate_phase - current_phase)
-                
-                # 如果相位跳跃仍然过大，跳过这个点
-                if phase_jump > phase_jump_threshold:
-                    continue
-                
-                # 设置解包裹相位
-                unwrapped_phase[ny, nx] = candidate_phase
-                
-                # 标记为已访问
-                visited[ny, nx] = True
-                
-                # 添加到优先队列
-                heapq.heappush(heap, (-enhanced_quality[ny, nx], ny, nx, candidate_phase))
-    
-    if mask is not None:
-        unwrapped_phase[~mask] = 0
-    return unwrapped_phase
-
-
-def edge_preserving_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    边缘保持的相位解包裹算法，专门用于保留物体的高度调制信息。
-    
-    参数:
-        wrapped_phase: 包裹相位图
-        quality_map: 相位质量图，值越大表示质量越高
-        mask: 投影区域掩膜，True 表示需要解包裹的区域
-    
-    返回:
-        unwrapped_phase: 解包裹后的相位图
-    """
-    import heapq
-    
-    # 图像尺寸
-    height, width = wrapped_phase.shape
-    
-    # 掩膜准备
-    if mask is None:
-        mask = np.ones((height, width), dtype=bool)
-    else:
-        mask = mask.astype(bool)
-        if mask.shape != (height, width):
-            raise ValueError(f"掩膜尺寸 {mask.shape} 与相位图尺寸 {(height, width)} 不匹配")
-    
-    # 创建访问标记数组
-    visited = np.zeros((height, width), dtype=bool)
-    # 掩膜外标记为已访问，避免出队
-    visited[~mask] = True
-    
-    # 创建输出的解包裹相位图
-    unwrapped_phase = np.zeros_like(wrapped_phase)
-    
-    # 计算相位梯度
-    grad_y, grad_x = np.gradient(wrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 使用Canny边缘检测来识别相位边缘
-    # 只对掩膜内数据进行归一化
-    temp_for_edges = np.zeros_like(wrapped_phase, dtype=np.float32)
-    temp_for_edges[mask] = wrapped_phase[mask].astype(np.float32)
-    phase_uint8 = cv2.normalize(temp_for_edges, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    edges = cv2.Canny(phase_uint8, 50, 150)
-    edges[~mask] = 0
-    
-    # 计算边缘强度
-    edge_strength = cv2.GaussianBlur(edges.astype(np.float32), (5, 5), 1.0)
-    edge_strength[~mask] = 0
-    
-    # 向量化检测相位跳跃
-    diff_h = np.diff(wrapped_phase, axis=1)
-    diff_h = (diff_h + np.pi) % (2 * np.pi) - np.pi
-    diff_v = np.diff(wrapped_phase, axis=0)
-    diff_v = (diff_v + np.pi) % (2 * np.pi) - np.pi
-    phase_jumps = np.zeros_like(wrapped_phase, dtype=np.float32)
-    phase_jumps[:, :-1] += np.abs(diff_h)
-    phase_jumps[:-1, :] += np.abs(diff_v)
-    phase_jumps[~mask] = 0
-    
-    # 创建增强的质量图，特别关注边缘区域
-    enhanced_quality = np.zeros_like(quality_map)
-    enhanced_quality[mask] = quality_map[mask]
-    
-    # 在边缘区域增加权重
-    max_edge = float(np.max(edge_strength[mask])) if np.any(mask) else 0.0
-    if max_edge > 0:
-        edge_weight = np.ones_like(edge_strength)
-        edge_weight[mask] = 1 + 2.0 * edge_strength[mask] / max_edge
-    enhanced_quality *= edge_weight
-    
-    # 在相位跳跃大的区域增加权重
-    max_jump = float(np.max(phase_jumps[mask])) if np.any(mask) else 0.0
-    if max_jump > 0:
-        jump_weight = np.ones_like(phase_jumps)
-        jump_weight[mask] = 1 + 1.5 * phase_jumps[mask] / max_jump
-    enhanced_quality *= jump_weight
-    
-    # 在相位梯度大的区域增加权重
-    max_grad = float(np.max(phase_gradient_magnitude[mask])) if np.any(mask) else 0.0
-    if max_grad > 0:
-        grad_weight = np.ones_like(phase_gradient_magnitude)
-        grad_weight[mask] = 1 + 1.0 * phase_gradient_magnitude[mask] / max_grad
-    enhanced_quality *= grad_weight
-    
-    # 掩膜外不参与
-    enhanced_quality[~mask] = 0
-    
-    # 创建质量排序索引
-    quality_flat = enhanced_quality.flatten()
-    indices = np.argsort(-quality_flat)  # 按质量降序排序的索引
-    
-    # 找到掩膜内质量最高的点作为种子点
-    seed_y, seed_x = None, None
-    for idx in indices:
-        y, x = np.unravel_index(idx, (height, width))
-        if mask[y, x]:
-            seed_y, seed_x = y, x
-            break
-    if seed_y is None:
-        # 掩膜为空，直接返回全零
-        return unwrapped_phase
-    
-    # 若掩膜区域过大，使用快速回退策略（最小二乘法）
-    mask_pixels = int(np.count_nonzero(mask))
-    if mask_pixels > 500000:
-        print(f"掩膜像素 {mask_pixels} 过大，边缘保持法回退为质量引导最小二乘解包裹以避免长时间运行…")
-        fast_unwrap = quality_guided_least_squares_unwrap(wrapped_phase, quality_map)
-        fast_unwrap[~mask] = 0
-        return fast_unwrap
-    
-    # 标记种子点为已访问
-    visited[seed_y, seed_x] = True
-    unwrapped_phase[seed_y, seed_x] = wrapped_phase[seed_y, seed_x]
-    
-    # 使用优先队列（堆）进行质量引导的解包裹
-    heap = [(-enhanced_quality[seed_y, seed_x], seed_y, seed_x, unwrapped_phase[seed_y, seed_x])]
-    
-    # 定义4邻域方向（更稳健且更快）
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    
-    # 动态相位跳跃阈值
-    base_threshold = np.pi * 0.9  # 稍微放宽阈值以保留更多细节
-    
-    processed = 0
-    max_to_process = mask_pixels
-    while heap:
-        neg_quality, y, x, current_phase = heapq.heappop(heap)
-        
-        # 对当前点的4个邻域进行检查
-        for dy, dx in directions:
-            ny, nx = y + dy, x + dx
-                
-            # 检查边界
-            if ny < 0 or ny >= height or nx < 0 or nx >= width:
-                continue
-                
-            # 必须在掩膜内
-            if not mask[ny, nx]:
-                continue
-                
-            # 如果邻域点未访问
-            if not visited[ny, nx]:
-                # 计算包裹相位差异
-                wrapped_diff = wrapped_phase[ny, nx] - wrapped_phase[y, x]
-                
-                # 将相位差异调整到 [-π, π] 范围
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 计算可能的解包裹相位值
-                candidate_phase = current_phase + wrapped_diff
-                
-                # 检查相位跳跃是否合理
-                phase_jump = abs(candidate_phase - current_phase)
-                
-                # 动态调整阈值：在边缘区域使用更宽松的阈值
-                local_edge_strength = edge_strength[ny, nx]
-                denom_edge = float(np.max(edge_strength[mask])) if np.any(mask) else 0.0
-                local_threshold = base_threshold * (1 + 0.5 * (local_edge_strength / denom_edge if denom_edge > 0 else 0.0))
-                
-                # 如果相位跳跃过大，尝试添加或减去2π的整数倍
-                if phase_jump > local_threshold:
-                    k = round((candidate_phase - current_phase) / (2 * np.pi))
-                    candidate_phase = current_phase + wrapped_diff - k * 2 * np.pi
-                    phase_jump = abs(candidate_phase - current_phase)
-                
-                # 如果相位跳跃仍然过大，跳过这个点
-                if phase_jump > local_threshold:
-                    continue
-                
-                # 设置解包裹相位
-                unwrapped_phase[ny, nx] = candidate_phase
-                
-                # 标记为已访问
-                visited[ny, nx] = True
-                
-                # 添加到优先队列
-                heapq.heappush(heap, (-enhanced_quality[ny, nx], ny, nx, candidate_phase))
-
-                processed += 1
-                if processed >= max_to_process:
-                    print("达到掩膜内像素上限，提前结束以避免长时间运行。")
-                    heap = []
-                    break
-    
-    # 掩膜外区域置零
-    unwrapped_phase[~mask] = 0
-    
-    return unwrapped_phase
-
-
-def quality_guided_least_squares_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    基于权重最小二乘(Weighted Least Squares, WLS)的Poisson相位解包裹。
-    思路：用包裹相位的一阶差分(经[-π,π]回卷)作为目标梯度，
-    以质量图作为权重，解泊松方程获得连续相位。
-    该方法能很好保留物体的细节调制信息，并避免路径依赖与过度平滑。
-
-    参数:
-        wrapped_phase: 包裹相位图 (H×W)
-        quality_map: 相位质量图 (H×W)，建议为[0,1]范围或任意正数
-
-    返回:
-        unwrapped_phase: 连续相位 (H×W)
-    """
-    from scipy.fft import dctn, idctn
-
-    height, width = wrapped_phase.shape
-    print(f"开始WLS-Poisson解包裹，图像尺寸: {height}x{width}")
-
-    # 归一化权重，避免为0
-    w = quality_map.astype(np.float64)
-    w = w / (np.max(w) + 1e-12)
-    w[w < 0] = 0
-    w = 0.05 + 0.95 * w  # 保证最小权重，防止孤岛
-
-    # 计算包裹相位梯度，并回卷到[-π, π]
-    def wrap_to_pi(x):
-        return (x + np.pi) % (2 * np.pi) - np.pi
-
-    gx = wrap_to_pi(wrapped_phase[:, 1:] - wrapped_phase[:, :-1])
-    gy = wrap_to_pi(wrapped_phase[1:, :] - wrapped_phase[:-1, :])
-
-    # 与权重相乘（边界对齐）
-    wx = 0.5 * (w[:, 1:] + w[:, :-1])
-    wy = 0.5 * (w[1:, :] + w[:-1, :])
-
-    gx_w = wx * gx
-    gy_w = wy * gy
-
-    # 计算散度 b = Dx^T(gx_w) + Dy^T(gy_w)
-    b = np.zeros_like(wrapped_phase, dtype=np.float64)
-    # x方向散度
-    b[:, :-1] -= gx_w
-    b[:, 1:] += gx_w
-    # y方向散度
-    b[:-1, :] -= gy_w
-    b[1:, :] += gy_w
-
-    # 用 Neumann 边界条件的DCT解 Poisson：Δphi = b
-    # 参考: https://en.wikipedia.org/wiki/Discrete_Poisson_equation#Discrete_cosine_transform
-    B = dctn(b, type=2, norm='ortho')
-
-    yy = np.arange(height)
-    xx = np.arange(width)
-    cos_y = np.cos(np.pi * yy / height)
-    cos_x = np.cos(np.pi * xx / width)
-    denom = (2 - 2 * cos_x)[None, :] + (2 - 2 * cos_y)[:, None]
-
-    # (0,0) 处的特征值为0，对应自由增益；将其强制为0，等价固定平均值
-    B[0, 0] = 0.0
-    denom[0, 0] = 1.0
-
-    Phi = B / denom
-    unwrapped = idctn(Phi, type=3, norm='ortho')
-
-    # 平移使最小值为0，便于显示
-    min_val = np.min(unwrapped)
-    if min_val < 0:
-        unwrapped = unwrapped - min_val
-
-    print("WLS-Poisson解包裹完成")
-    return unwrapped
-
-
-def _apply_global_smoothing(unwrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    应用全局平滑优化，确保相位连续性
-    """
-    from scipy.ndimage import gaussian_filter
-    
-    height, width = unwrapped_phase.shape
-    
-    # 计算相位梯度
-    grad_y, grad_x = np.gradient(unwrapped_phase)
-    gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 检测异常大的梯度
-    median_grad = np.median(gradient_magnitude)
-    mad = np.median(np.abs(gradient_magnitude - median_grad))
-    threshold = median_grad + 2 * mad
-    
-    # 对异常区域进行平滑
-    abnormal_mask = gradient_magnitude > threshold
-    
-    if np.any(abnormal_mask):
-        print(f"检测到 {np.sum(abnormal_mask)} 个异常梯度点，进行平滑处理...")
-        
-        # 使用自适应高斯滤波
-        sigma = 1.5
-        smoothed_phase = gaussian_filter(unwrapped_phase, sigma=sigma)
-        
-        # 根据质量进行加权混合
-        quality_normalized = quality_map / (np.max(quality_map) + 1e-10)
-        
-        # 在异常区域使用更多平滑
-        smooth_weight = np.where(abnormal_mask, 0.8, 0.3)
-        unwrapped_phase = (1 - smooth_weight) * unwrapped_phase + smooth_weight * smoothed_phase
-    
-    # 应用全局轻微平滑
-    sigma = 0.8
-    smoothed_phase = gaussian_filter(unwrapped_phase, sigma=sigma)
-    
-    # 根据质量进行加权混合
-    quality_normalized = quality_map / (np.max(quality_map) + 1e-10)
-    unwrapped_phase = 0.7 * unwrapped_phase + 0.3 * smoothed_phase
-    
-    # 确保相位非负
-    min_phase = np.min(unwrapped_phase)
-    if min_phase < 0:
-        unwrapped_phase = unwrapped_phase - min_phase
-        print(f"相位已偏移，最小值为: {min_phase:.2f}")
-    
-    return unwrapped_phase
-
-
-def _iterative_phase_optimization(wrapped_phase: np.ndarray, initial_unwrapped: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    使用迭代方法优化解包裹相位
-    """
-    from scipy.ndimage import gaussian_filter
-    
-    height, width = initial_unwrapped.shape
-    optimized_phase = initial_unwrapped.copy()
-    
-    print("开始迭代优化...")
-    
-    # 迭代次数
-    max_iterations = 5
-    
-    for iteration in range(max_iterations):
-        print(f"迭代 {iteration + 1}/{max_iterations}")
-        
-        # 计算当前相位的梯度
-        grad_y, grad_x = np.gradient(optimized_phase)
-        gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-        
-        # 检测需要优化的区域（梯度变化大的区域）
-        median_grad = np.median(gradient_magnitude)
-        mad = np.median(np.abs(gradient_magnitude - median_grad))
-        threshold = median_grad + 2 * mad
-        
-        # 找到需要优化的像素
-        optimize_mask = gradient_magnitude > threshold
-        
-        if not np.any(optimize_mask):
-            print("没有需要优化的像素，提前结束迭代")
-            break
-        
-        print(f"优化 {np.sum(optimize_mask)} 个像素")
-        
-        # 对需要优化的像素进行局部优化
-        for y in range(1, height - 1):
-            for x in range(1, width - 1):
-                if not optimize_mask[y, x]:
-                    continue
-                
-                # 计算与邻域像素的相位关系
-                neighbors = []
-                weights = []
-                
-                # 检查4邻域
-                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < height and 0 <= nx < width:
-                        # 计算包裹相位差
-                        wrapped_diff = wrapped_phase[y, x] - wrapped_phase[ny, nx]
-                        wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                        
-                        # 计算期望的相位值
-                        expected_phase = optimized_phase[ny, nx] + wrapped_diff
-                        neighbors.append(expected_phase)
-                        
-                        # 使用质量作为权重
-                        weight = np.sqrt(quality_map[y, x] * quality_map[ny, nx])
-                        weights.append(weight)
-                
-                if len(neighbors) > 0:
-                    # 使用加权平均更新相位
-                    weights = np.array(weights)
-                    weights = weights / (np.sum(weights) + 1e-10)
-                    
-                    new_phase = np.sum(np.array(neighbors) * weights)
-                    
-                    # 平滑更新
-                    alpha = 0.3  # 更新步长
-                    optimized_phase[y, x] = (1 - alpha) * optimized_phase[y, x] + alpha * new_phase
-        
-        # 应用轻微的高斯平滑
-        if iteration < max_iterations - 1:  # 最后一次迭代不进行平滑
-            sigma = 0.5
-            smoothed_phase = gaussian_filter(optimized_phase, sigma=sigma)
-            
-            # 根据质量进行加权混合
-            quality_normalized = quality_map / (np.max(quality_map) + 1e-10)
-            optimized_phase = 0.8 * optimized_phase + 0.2 * smoothed_phase
-    
-    print("迭代优化完成")
-    return optimized_phase
-
-
-def _global_least_squares_optimization(wrapped_phase: np.ndarray, initial_unwrapped: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    使用全局最小二乘法优化解包裹相位
-    """
-    from scipy.sparse import csr_matrix
-    from scipy.sparse.linalg import spsolve
-    
-    height, width = initial_unwrapped.shape
-    total_pixels = height * width
-    
-    print(f"构建全局最小二乘系统，像素总数: {total_pixels}")
-    
-    # 构建线性系统 Ax = b
-    # 其中 A 是约束矩阵，x 是解包裹相位，b 是包裹相位差
-    row_indices = []
-    col_indices = []
-    data = []
-    rhs = []
-    
-    equation_count = 0
-    
-    # 为每个像素建立相位连续性约束
-    for y in range(height):
-        for x in range(width):
-            # 与右邻域的约束
-            if x < width - 1:
-                # 约束: phi[y,x+1] - phi[y,x] = wrapped_diff
-                wrapped_diff = wrapped_phase[y, x+1] - wrapped_phase[y, x]
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 使用质量作为权重
-                weight = np.sqrt(quality_map[y, x] * quality_map[y, x+1])
-                
-                if weight > 0.1:  # 只考虑质量足够高的约束
-                    row_indices.append(equation_count)
-                    col_indices.append(y * width + x)
-                    data.append(-weight)
-                    
-                    row_indices.append(equation_count)
-                    col_indices.append(y * width + (x + 1))
-                    data.append(weight)
-                    
-                    rhs.append(weight * wrapped_diff)
-                    equation_count += 1
-            
-            # 与下邻域的约束
-            if y < height - 1:
-                # 约束: phi[y+1,x] - phi[y,x] = wrapped_diff
-                wrapped_diff = wrapped_phase[y+1, x] - wrapped_phase[y, x]
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 使用质量作为权重
-                weight = np.sqrt(quality_map[y, x] * quality_map[y+1, x])
-                
-                if weight > 0.1:  # 只考虑质量足够高的约束
-                    row_indices.append(equation_count)
-                    col_indices.append(y * width + x)
-                    data.append(-weight)
-                    
-                    row_indices.append(equation_count)
-                    col_indices.append((y + 1) * width + x)
-                    data.append(weight)
-                    
-                    rhs.append(weight * wrapped_diff)
-                    equation_count += 1
-    
-    print(f"构建了 {equation_count} 个约束方程")
-    
-    if equation_count == 0:
-        print("没有足够的约束方程，返回初始解包裹结果")
-        return initial_unwrapped
-    
-    # 添加初始值约束（防止解发散）
-    for i in range(min(100, total_pixels)):  # 只约束前100个像素
-        y = i // width
-        x = i % width
-        row_indices.append(equation_count)
-        col_indices.append(i)
-        data.append(1.0)
-        rhs.append(initial_unwrapped[y, x])
-        equation_count += 1
-    
-    # 构建稀疏矩阵
-    A = csr_matrix((data, (row_indices, col_indices)), 
-                  shape=(equation_count, total_pixels))
-    
-    # 求解最小二乘问题
-    try:
-        print("求解最小二乘问题...")
-        # 使用正则化防止过拟合
-        regularization = 0.01
-        ATA = A.T @ A
-        ATA += regularization * csr_matrix((np.ones(total_pixels), 
-                                          (np.arange(total_pixels), np.arange(total_pixels))), 
-                                         shape=(total_pixels, total_pixels))
-        
-        solution = spsolve(ATA, A.T @ np.array(rhs))
-        optimized_phase = solution.reshape((height, width))
-        
-        print("全局最小二乘法优化成功")
-        return optimized_phase
-        
-    except Exception as e:
-        print(f"全局最小二乘法优化失败: {e}")
-        print("返回初始解包裹结果")
-        return initial_unwrapped
-
-
-def _final_smoothing(unwrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    最终平滑处理，确保相位连续性
-    """
-    from scipy.ndimage import gaussian_filter
-    
-    # 计算相位梯度
-    grad_y, grad_x = np.gradient(unwrapped_phase)
-    gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 检测异常大的梯度
-    median_grad = np.median(gradient_magnitude)
-    mad = np.median(np.abs(gradient_magnitude - median_grad))
-    threshold = median_grad + 3 * mad
-    
-    # 对异常区域进行平滑
-    abnormal_mask = gradient_magnitude > threshold
-    
-    if np.any(abnormal_mask):
-        print(f"检测到 {np.sum(abnormal_mask)} 个异常梯度点，进行平滑处理...")
-        
-        # 使用自适应高斯滤波
-        sigma = 1.0
-        smoothed_phase = gaussian_filter(unwrapped_phase, sigma=sigma)
-        
-        # 根据质量进行加权混合
-        quality_normalized = quality_map / (np.max(quality_map) + 1e-10)
-        
-        # 在异常区域使用更多平滑
-        smooth_weight = np.where(abnormal_mask, 0.7, 0.2)
-        unwrapped_phase = (1 - smooth_weight) * unwrapped_phase + smooth_weight * smoothed_phase
-    
-    # 确保相位非负
-    min_phase = np.min(unwrapped_phase)
-    if min_phase < 0:
-        unwrapped_phase = unwrapped_phase - min_phase
-        print(f"相位已偏移，最小值为: {min_phase:.2f}")
-    
-    return unwrapped_phase
-
-
-def _block_based_quality_guided_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    分块处理大图像的质量引导解包裹
-    """
-    height, width = wrapped_phase.shape
-    block_size = 256  # 分块大小
-    
-    # 计算分块数量
-    blocks_y = (height + block_size - 1) // block_size
-    blocks_x = (width + block_size - 1) // block_size
-    
-    print(f"将图像分为 {blocks_y}x{blocks_x} 个块进行处理")
-    
-    # 初始化结果
-    unwrapped_phase = np.zeros_like(wrapped_phase)
-    
-    # 处理每个块
-    for by in range(blocks_y):
-        for bx in range(blocks_x):
-            print(f"处理块 ({by+1}/{blocks_y}, {bx+1}/{blocks_x})")
-            
-            # 计算块边界
-            y_start = by * block_size
-            y_end = min((by + 1) * block_size, height)
-            x_start = bx * block_size
-            x_end = min((bx + 1) * block_size, width)
-            
-            # 提取块
-            block_wrapped = wrapped_phase[y_start:y_end, x_start:x_end]
-            block_quality = quality_map[y_start:y_end, x_start:x_end]
-            
-            # 对块进行解包裹
-            block_unwrapped = improved_quality_guided_unwrap(block_wrapped, block_quality)
-            
-            # 存储结果
-            unwrapped_phase[y_start:y_end, x_start:x_end] = block_unwrapped
-    
-    # 块间平滑处理
-    print("进行块间平滑处理...")
-    unwrapped_phase = _smooth_block_boundaries(unwrapped_phase, block_size)
-    
-    return unwrapped_phase
-
-
-def _local_least_squares_refinement(wrapped_phase: np.ndarray, initial_unwrapped: np.ndarray, 
-                                   quality_map: np.ndarray, window_size: int = 5) -> np.ndarray:
-    """
-    使用局部最小二乘法优化解包裹相位
-    """
-    height, width = initial_unwrapped.shape
-    refined_phase = initial_unwrapped.copy()
-    
-    # 计算相位梯度
-    grad_y, grad_x = np.gradient(initial_unwrapped)
-    
-    # 检测需要优化的区域（梯度变化大的区域）
-    gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    median_grad = np.median(gradient_magnitude)
-    mad = np.median(np.abs(gradient_magnitude - median_grad))
-    threshold = median_grad + 2 * mad
-    
-    # 找到需要优化的像素
-    optimize_mask = gradient_magnitude > threshold
-    
-    if not np.any(optimize_mask):
-        return refined_phase
-    
-    print(f"对 {np.sum(optimize_mask)} 个像素进行局部优化")
-    
-    # 对需要优化的像素进行局部最小二乘法优化
-    half_window = window_size // 2
-    
-    for y in range(half_window, height - half_window):
-        for x in range(half_window, width - half_window):
-            if not optimize_mask[y, x]:
-                continue
-            
-            # 提取局部窗口
-            y_start = y - half_window
-            y_end = y + half_window + 1
-            x_start = x - half_window
-            x_end = x + half_window + 1
-            
-            local_wrapped = wrapped_phase[y_start:y_end, x_start:x_end]
-            local_unwrapped = initial_unwrapped[y_start:y_end, x_start:x_end]
-            local_quality = quality_map[y_start:y_end, x_start:x_end]
-            
-            # 对中心像素进行优化
-            center_y, center_x = half_window, half_window
-            
-            # 计算与邻域像素的相位关系
-            neighbors = []
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
-                    if dy == 0 and dx == 0:
-                        continue
-                    ny, nx = center_y + dy, center_x + dx
-                    if 0 <= ny < window_size and 0 <= nx < window_size:
-                        neighbors.append((ny, nx))
-            
-            if len(neighbors) < 2:
-                continue
-            
-            # 使用加权最小二乘法优化中心像素
-            total_weight = 0
-            weighted_sum = 0
-            
-            for ny, nx in neighbors:
-                # 计算包裹相位差
-                wrapped_diff = local_wrapped[center_y, center_x] - local_wrapped[ny, nx]
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 使用质量作为权重
-                weight = local_quality[ny, nx]
-                total_weight += weight
-                weighted_sum += weight * (local_unwrapped[ny, nx] + wrapped_diff)
-            
-            if total_weight > 0:
-                # 更新中心像素
-                refined_phase[y, x] = weighted_sum / total_weight
-    
-    return refined_phase
-
-
-def _smooth_block_boundaries(unwrapped_phase: np.ndarray, block_size: int) -> np.ndarray:
-    """
-    平滑分块边界
-    """
-    height, width = unwrapped_phase.shape
-    
-    # 对垂直边界进行平滑
-    for x in range(block_size, width, block_size):
-        if x < width - 1:
-            # 获取边界两侧的像素
-            left_col = unwrapped_phase[:, x-1]
-            right_col = unwrapped_phase[:, x]
-            
-            # 计算相位偏移
-            phase_diff = right_col - left_col
-            phase_diff = np.mod(phase_diff + np.pi, 2 * np.pi) - np.pi
-            
-            # 应用平滑
-            smooth_width = min(5, block_size // 4)
-            for i in range(smooth_width):
-                if x + i < width:
-                    alpha = i / smooth_width
-                    unwrapped_phase[:, x + i] = (1 - alpha) * left_col + alpha * right_col
-    
-    # 对水平边界进行平滑
-    for y in range(block_size, height, block_size):
-        if y < height - 1:
-            # 获取边界两侧的像素
-            top_row = unwrapped_phase[y-1, :]
-            bottom_row = unwrapped_phase[y, :]
-            
-            # 计算相位偏移
-            phase_diff = bottom_row - top_row
-            phase_diff = np.mod(phase_diff + np.pi, 2 * np.pi) - np.pi
-            
-            # 应用平滑
-            smooth_width = min(5, block_size // 4)
-            for i in range(smooth_width):
-                if y + i < height:
-                    alpha = i / smooth_width
-                    unwrapped_phase[y + i, :] = (1 - alpha) * top_row + alpha * bottom_row
-    
-    return unwrapped_phase
-
-
-def _post_process_unwrapped_phase(unwrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    后处理解包裹相位，确保连续性和非负性
-    """
-    from scipy.ndimage import median_filter, gaussian_filter
-    
-    # 1. 检测并修复相位跳跃
-    grad_y, grad_x = np.gradient(unwrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 检测异常大的梯度
-    median_grad = np.median(phase_gradient_magnitude)
-    mad = np.median(np.abs(phase_gradient_magnitude - median_grad))
-    threshold = median_grad + 3 * mad
-    
-    jump_mask = phase_gradient_magnitude > threshold
-    
-    if np.any(jump_mask):
-        print(f"检测到 {np.sum(jump_mask)} 个相位跳跃点，进行修复...")
-        
-        # 对跳跃点进行局部中值滤波
-        unwrapped_phase = median_filter(unwrapped_phase, size=3)
-    
-    # 2. 确保相位非负
-    min_phase = np.min(unwrapped_phase)
-    if min_phase < 0:
-        unwrapped_phase = unwrapped_phase - min_phase
-        print(f"相位已偏移，最小值为: {min_phase:.2f}")
-    
-    # 3. 最终平滑
-    # 使用自适应高斯滤波进行最终平滑
-    sigma = 0.5
-    smoothed_phase = gaussian_filter(unwrapped_phase, sigma=sigma)
-    
-    # 根据质量进行加权混合
-    quality_normalized = quality_map / (np.max(quality_map) + 1e-10)
-    unwrapped_phase = 0.8 * unwrapped_phase + 0.2 * smoothed_phase
-    
-    return unwrapped_phase
-
-
-def three_step_optimized_unwrap(wrapped_phase: np.ndarray, quality_map: np.ndarray) -> np.ndarray:
-    """
-    专门针对三步相移算法优化的相位解包裹方法
-    
-    参数:
-        wrapped_phase: 包裹相位图
-        quality_map: 相位质量图
-    
-    返回:
-        unwrapped_phase: 解包裹后的相位图
-    """
-    print("使用三步相移专用解包裹算法...")
-    
-    # 1. 预处理包裹相位 - 使用更小的高斯核以保留更多细节
-    wrapped_phase = cv2.GaussianBlur(wrapped_phase.astype(np.float32), (3, 3), 0.6)
-    
-    # 2. 计算相位梯度，用于增强质量图和动态阈值
-    grad_y, grad_x = np.gradient(wrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 计算梯度统计特性，用于动态阈值
-    median_grad = np.median(phase_gradient_magnitude)
-    std_grad = np.std(phase_gradient_magnitude)
-    
-    # 3. 增强质量图 - 结合原始质量和相位连续性
-    enhanced_quality = quality_map * (1 + 0.9 * (1 - phase_gradient_magnitude / np.max(phase_gradient_magnitude)))
-    
-    # 4. 使用改进的质量引导解包裹算法，但使用更宽松的相位跳跃阈值
-    height, width = wrapped_phase.shape
-    unwrapped_phase = np.zeros_like(wrapped_phase)
-    visited = np.zeros((height, width), dtype=bool)
-    
-    # 找到质量最高的点作为种子点
-    seed_y, seed_x = np.unravel_index(np.argmax(enhanced_quality), enhanced_quality.shape)
-    
-    # 初始化种子点
-    unwrapped_phase[seed_y, seed_x] = wrapped_phase[seed_y, seed_x]
-    visited[seed_y, seed_x] = True
-    
-    # 使用优先队列进行解包裹
-    import heapq
-    
-    # 队列元素：(负质量值, y, x, 当前相位值)
-    heap = [(-enhanced_quality[seed_y, seed_x], seed_y, seed_x, unwrapped_phase[seed_y, seed_x])]
-    
-    # 定义4邻域方向（不包括对角线）- 对于三步相移，4邻域更稳定
-    directions = [(-1, 0), (0, -1), (0, 1), (1, 0)]
-    
-    # 动态相位跳跃阈值 - 基于相位梯度的统计特性
-    base_threshold = np.pi * 1.8  # 基础阈值
-    dynamic_factor = 1.0 + 0.5 * (median_grad / np.pi)  # 动态因子
-    phase_jump_threshold = base_threshold * dynamic_factor
-    
-    print(f"三步相移动态阈值: {phase_jump_threshold}")
-    
-    while heap:
-        neg_quality, y, x, current_phase = heapq.heappop(heap)
-        
-        # 对当前点的4个邻域进行检查
-        for dy, dx in directions:
-            ny, nx = y + dy, x + dx
-                
-            # 检查边界
-            if ny < 0 or ny >= height or nx < 0 or nx >= width:
-                continue
-                
-            # 如果邻域点未访问
-            if not visited[ny, nx]:
-                # 计算包裹相位差异
-                wrapped_diff = wrapped_phase[ny, nx] - wrapped_phase[y, x]
-                
-                # 将相位差异调整到 [-π, π] 范围
-                wrapped_diff = np.mod(wrapped_diff + np.pi, 2 * np.pi) - np.pi
-                
-                # 计算可能的解包裹相位值
-                candidate_phase = current_phase + wrapped_diff
-                
-                # 检查相位跳跃是否合理
-                phase_jump = abs(candidate_phase - current_phase)
-                
-                # 局部动态阈值 - 根据局部梯度调整
-                local_gradient = phase_gradient_magnitude[ny, nx]
-                local_threshold = phase_jump_threshold
-                
-                # 在梯度较大的区域使用更宽松的阈值
-                if local_gradient > median_grad * 1.5:
-                    local_threshold = phase_jump_threshold * 1.2
-                
-                if phase_jump > local_threshold:
-                    # 如果相位跳跃过大，尝试添加或减去2π的整数倍
-                    k = round((candidate_phase - current_phase) / (2 * np.pi))
-                    candidate_phase = current_phase + wrapped_diff - k * 2 * np.pi
-                    phase_jump = abs(candidate_phase - current_phase)
-                    
-                    # 如果相位跳跃仍然过大，跳过这个点
-                    if phase_jump > local_threshold:
-                        continue
-                
-                # 设置解包裹相位
-                unwrapped_phase[ny, nx] = candidate_phase
-                
-                # 标记为已访问
-                visited[ny, nx] = True
-                
-                # 将邻域点加入队列 - 使用增强质量图
-                heapq.heappush(heap, (-enhanced_quality[ny, nx], ny, nx, candidate_phase))
-    
-    # 4. 后处理 - 增强版本
-    from scipy.ndimage import gaussian_filter, median_filter
-    
-    # 检测并修复相位跳跃
-    grad_y, grad_x = np.gradient(unwrapped_phase)
-    phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-    
-    # 检测异常大的梯度
-    median_grad_post = np.median(phase_gradient_magnitude)
-    mad = np.median(np.abs(phase_gradient_magnitude - median_grad_post))
-    threshold = median_grad_post + 3 * mad
-    
-    jump_mask = phase_gradient_magnitude > threshold
-    
-    if np.any(jump_mask):
-        print(f"检测到 {np.sum(jump_mask)} 个相位跳跃点，进行修复...")
-        # 创建修复掩码的扩展版本（包括周围像素）
-        from scipy.ndimage import binary_dilation
-        repair_mask = binary_dilation(jump_mask, iterations=2)
-        
-        # 保存原始相位值
-        original_phase = unwrapped_phase.copy()
-        
-        # 对跳跃区域进行局部中值滤波
-        filtered_phase = median_filter(unwrapped_phase, size=5)
-        
-        # 只替换需要修复的区域
-        unwrapped_phase[repair_mask] = filtered_phase[repair_mask]
-        
-        # 平滑修复区域的边界
-        boundary_mask = binary_dilation(repair_mask, iterations=1) & ~repair_mask
-        if np.any(boundary_mask):
-            # 在边界区域进行加权平均
-            alpha = 0.5
-            unwrapped_phase[boundary_mask] = (alpha * unwrapped_phase[boundary_mask] + 
-                                             (1-alpha) * filtered_phase[boundary_mask])
-    
-    # 自适应平滑处理
-    # 1. 先进行中值滤波去除离群点
-    unwrapped_phase = cv2.medianBlur(unwrapped_phase.astype(np.float32), 5)
-    
-    # 2. 计算局部噪声水平
-    local_std = cv2.boxFilter(np.abs(unwrapped_phase - cv2.GaussianBlur(unwrapped_phase, (5,5), 0)), 
-                             -1, (15,15), normalize=True)
-    
-    # 3. 根据局部噪声水平自适应调整高斯滤波的强度
-    noise_level = np.clip(local_std / np.mean(local_std), 0.5, 2.0)
-    
-    # 创建自适应高斯滤波的结果
-    smoothed_phase = gaussian_filter(unwrapped_phase, sigma=1.5)
-    
-    # 在噪声较大的区域使用更强的平滑
-    high_noise_mask = noise_level > 1.2
-    if np.any(high_noise_mask):
-        strong_smoothed = gaussian_filter(unwrapped_phase, sigma=2.5)
-        smoothed_phase[high_noise_mask] = strong_smoothed[high_noise_mask]
-    
-    # 4. 质量加权混合原始解包裹相位和平滑后的相位
-    # 使用质量图作为权重，质量高的区域保留更多原始细节
-    normalized_quality = enhanced_quality / np.max(enhanced_quality)
-    weight_map = np.clip(normalized_quality, 0.3, 0.8)  # 限制权重范围
-    
-    # 加权混合
-    unwrapped_phase = weight_map * unwrapped_phase + (1 - weight_map) * smoothed_phase
-    
-    # 5. 最后进行轻微的中值滤波去除可能的伪影
-    unwrapped_phase = cv2.medianBlur(unwrapped_phase.astype(np.float32), 3)
-    
-    return unwrapped_phase
-
-
+# 【已删除】以下冗余的解包裹函数已被删除：
+# - improved_quality_guided_unwrap()
+# - robust_phase_unwrap()
+# - three_step_optimized_unwrap()
+#
+# 现在统一使用 quality_guided_unwrap() 函数
+# 通过 UnwrapConfig 参数适配不同的相移算法
 
 
 def visualize_unwrapped_phase(unwrapped_phase: np.ndarray, title: str = "Unwrapped Phase", 
@@ -2511,38 +850,38 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
     
     # 1. 首先生成或复用投影区域掩膜（如果启用）
     mask = None
+    parent_dir = os.path.abspath(os.path.join(output_dir, os.pardir))
+    mask_assets_dir = os.path.join(parent_dir, 'mask')
+    
     if use_mask:
         # 计算共享掩膜路径：若 output_dir 为 .../horizontal 或 .../vertical，则共享目录为其父目录
         shared_mask_path = None
         if use_shared_mask:
-            parent_dir = os.path.abspath(os.path.join(output_dir, os.pardir))
             shared_mask_path = os.path.join(parent_dir, shared_mask_name)
-            # 准备保存特征图的目录
-            mask_assets_dir = os.path.join(parent_dir, 'mask')
-            os.makedirs(mask_assets_dir, exist_ok=True)
 
-        # 优先复用共享掩膜
-        if use_shared_mask and os.path.isfile(shared_mask_path):
-            print(f"检测到共享掩膜，直接复用: {shared_mask_path}")
-            mask_img = cv2.imdecode(np.fromfile(shared_mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-            mask = (mask_img > 0)
-            # 不再在方向文件夹下重复保存掩膜
-        else:
-            print(f"生成投影区域掩膜，方法: {mask_method}")
-            try:
-                mask = generate_projection_mask(images, algorithm=algorithm, method=mask_method, min_area=min_area, confidence=mask_confidence)
-                print(f"掩膜生成完成，投影区域像素数: {np.sum(mask)}")
-                # 同时保存为共享掩膜，供另一方向复用（保存到 mask/final_mask.png）
-                if use_shared_mask and shared_mask_path is not None:
-                    cv2.imwrite(shared_mask_path, mask.astype(np.uint8) * 255)
-                    print(f"共享掩膜已保存至: {shared_mask_path}")
-            except Exception as e:
-                print(f"掩膜生成失败: {e}，将不使用掩膜")
-                mask = None
-    else:
-        # 如果不使用掩膜，创建一个全True的掩膜
+        # 使用封装好的函数获取或创建掩膜
+        try:
+            mask = get_or_create_mask(
+                images=images,
+                algorithm=algorithm,
+                use_shared_mask=use_shared_mask,
+                shared_mask_path=shared_mask_path,
+                mask_method=mask_method,
+                thresh_rel=None,
+                min_area=min_area,
+                confidence=mask_confidence,
+                border_trim_px=10,
+                save_visualization=True,
+                visualization_dir=mask_assets_dir
+            )
+        except Exception as e:
+            print(f"掩膜生成失败: {e}，将使用全图掩膜")
+            mask = np.ones((images[0].shape[0], images[0].shape[1]), dtype=bool)
+    
+    # 确保掩膜不为None，并且尺寸正确
+    if mask is None or mask.shape != (images[0].shape[0], images[0].shape[1]):
+        print("警告：掩膜无效或尺寸不匹配，使用全图掩膜")
         mask = np.ones((images[0].shape[0], images[0].shape[1]), dtype=bool)
-        print("未使用掩膜，将在整个图像区域进行处理")
     
     # 2. 计算包裹相位与质量图（仅用于解包裹；不再在各方向文件夹保存额外可视化图）
     print("在掩膜约束下计算包裹相位...")
@@ -2551,91 +890,24 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
     print("在掩膜约束下计算相位质量图...")
     quality_map = compute_phase_quality_masked(images, mask)
 
-    # 2.1 保存掩膜相关的可视化到共享 mask/ 目录
-    parent_dir = os.path.abspath(os.path.join(output_dir, os.pardir))
-    mask_assets_dir = os.path.join(parent_dir, 'mask')
-    os.makedirs(mask_assets_dir, exist_ok=True)
-    # 重新计算与 test.py 对齐的 A, M, I_mean，并保存
-    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
-    I_max = np.max(imgs, axis=2)
-    I_min = np.min(imgs, axis=2)
-    I_mean = np.mean(imgs, axis=2)
-    A = (I_max - I_min) / 2.0
-    M = (I_max - I_min) / (I_max + I_min + 1e-9)
-    A_img = cv2.normalize(A, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    M_img = cv2.normalize(M, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    I_img = cv2.normalize(I_mean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    cv2.imwrite(os.path.join(mask_assets_dir, 'Amplitude.png'), A_img)
-    cv2.imwrite(os.path.join(mask_assets_dir, 'Modulation.png'), M_img)
-    cv2.imwrite(os.path.join(mask_assets_dir, 'Mean Intensity.png'), I_img)
-    # 最终掩膜副本
-    cv2.imwrite(os.path.join(mask_assets_dir, 'Final Mask.png'), (mask.astype(np.uint8) * 255))
-
-    # 解包裹
-    print(f"使用解包裹方法: {method}")
+    # 解包裹（统一使用quality_guided_unwrap，通过配置适配不同算法）
+    print(f"开始相位解包裹...")
     
-    # 对于三步相移算法，需要特殊处理
-    is_three_step = (num_images == 3)
-    if is_three_step:
-        print("检测到三步相移算法，使用特殊处理...")
-        # 对于三步相移，增强质量图以提高解包裹效果
-        quality_map = quality_map * 2.0  # 增加质量图增强系数
-        # 对于三步相移，使用更宽松的相位跳跃阈值
-        print("为三步相移设置更宽松的相位跳跃阈值...")
-        # 预处理包裹相位，减少噪声（只在掩膜区域内）
-        if np.any(mask):
-            # 先进行高斯模糊减少噪声
-            wrapped_phase = cv2.GaussianBlur(wrapped_phase.astype(np.float32), (3, 3), 0.5)
-            # 然后进行中值滤波去除离群点
-            wrapped_phase = cv2.medianBlur(wrapped_phase.astype(np.float32), 3)
-            # 确保掩膜外区域仍为0
-            wrapped_phase[~mask] = 0
+    # 根据相移算法自动选择最佳配置
+    unwrap_config = UnwrapConfig.for_algorithm(algorithm)
     
-    # 根据解包裹方法选择相应的算法
-    if method == "quality_guided":
-        # 使用严格掩膜约束的质量引导解包裹算法
-        unwrapped_phase = quality_guided_unwrap_with_strict_mask(wrapped_phase, quality_map, is_three_step=is_three_step, mask=mask)
-    elif method == "improved_quality_guided":
-        # 使用改进的质量引导解包裹算法
-        unwrapped_phase = improved_quality_guided_unwrap(wrapped_phase, quality_map, is_three_step=is_three_step, mask=mask)
-    elif method == "robust":
-        # 使用鲁棒的相位解包裹算法
-        unwrapped_phase = robust_phase_unwrap(wrapped_phase, quality_map, is_three_step=is_three_step, mask=mask)
-    elif method == "three_step_optimized":
-        # 使用三步相移专用解包裹方法
-        unwrapped_phase = three_step_optimized_unwrap(wrapped_phase, quality_map)
-        # 确保掩膜外区域为0
-        unwrapped_phase[~mask] = 0
-    else:
-        raise ValueError(f"未知的解包裹方法: {method}")
-        
-    # 对于三步相移，需要额外的平滑处理
-    if is_three_step:
-        from scipy.ndimage import gaussian_filter, median_filter
-        # 增强平滑以减少三步相移的噪声
-        print("对三步相移解包裹结果进行增强平滑处理...")
-        # 只在掩膜区域内进行平滑处理
-        if np.any(mask):
-            # 检测并修复相位跳跃
-            grad_y, grad_x = np.gradient(unwrapped_phase)
-            phase_gradient_magnitude = np.sqrt(grad_y**2 + grad_x**2)
-            # 检测异常大的梯度
-            median_grad = np.median(phase_gradient_magnitude[mask])
-            mad = np.median(np.abs(phase_gradient_magnitude[mask] - median_grad))
-            threshold = median_grad + 3 * mad
-            jump_mask = phase_gradient_magnitude > threshold
-            if np.any(jump_mask):
-                print(f"检测到 {np.sum(jump_mask)} 个相位跳跃点，进行修复...")
-                # 对跳跃点进行局部中值滤波
-                unwrapped_phase = median_filter(unwrapped_phase, size=5)
-            # 先进行中值滤波去除离群点
-            unwrapped_phase = cv2.medianBlur(unwrapped_phase.astype(np.float32), 5)
-            # 然后进行高斯平滑
-            unwrapped_phase = gaussian_filter(unwrapped_phase, sigma=1.5)
-            # 再次进行中值滤波去除可能的伪影
-            unwrapped_phase = cv2.medianBlur(unwrapped_phase.astype(np.float32), 3)
-            # 确保掩膜外区域仍为0
-            unwrapped_phase[~mask] = 0
+    # 可选：根据method参数微调配置（保留与UI的兼容性）
+    if method == "robust":
+        # 鲁棒模式：更保守的参数
+        unwrap_config.base_threshold = unwrap_config.base_threshold * 0.8
+    
+    # 调用统一的解包裹函数
+    unwrapped_phase = quality_guided_unwrap(
+        wrapped_phase=wrapped_phase,
+        quality_map=quality_map,
+        mask=mask,
+        config=unwrap_config
+    )
 
     # 后处理：平移相位值，使最小值为0（所有值为非负数）
     # 只在掩膜区域内计算最小值
@@ -2672,89 +944,6 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
     }
 
 
-def test_all_unwrap_methods(image_paths: List[str], output_base_dir: str, show_plots: bool = True) -> Dict[str, np.ndarray]:
-    """
-    测试所有可用的解包裹方法，比较它们的效果
-    
-    参数:
-        image_paths: 相移图像路径列表
-        output_base_dir: 输出基础目录
-        show_plots: 是否显示图形
-    
-    返回:
-        results: 包含所有方法结果的字典
-    """
-    methods = ["quality_guided", "improved_quality_guided", "robust"]
-    results = {}
-    
-    for method in methods:
-        print(f"\n=== 测试解包裹方法: {method} ===")
-        output_dir = os.path.join(output_base_dir, method)
-        
-        try:
-            result = process_single_frequency_images(
-                image_paths=image_paths,
-                output_dir=output_dir,
-                method=method,
-                show_plots=show_plots
-            )
-            
-            if result is not None:
-                results[method] = result
-                print(f"方法 {method} 处理完成")
-            else:
-                print(f"方法 {method} 处理失败")
-                
-        except Exception as e:
-            print(f"方法 {method} 出现错误: {e}")
-    
-    return results
-
-
-def compare_unwrap_methods(results: Dict[str, np.ndarray], save_path: Optional[str] = None, show_plots: bool = True):
-    """
-    比较不同解包裹方法的结果
-    
-    参数:
-        results: 包含不同方法结果的字典
-        save_path: 保存路径 (可选)
-        show_plots: 是否显示图形
-    """
-    if not results:
-        print("没有可比较的结果")
-        return
-    
-    # 计算子图布局
-    n_methods = len(results)
-    n_cols = min(3, n_methods)
-    n_rows = (n_methods + n_cols - 1) // n_cols
-    
-    plt.figure(figsize=(5 * n_cols, 4 * n_rows))
-    
-    for i, (method, result) in enumerate(results.items()):
-        if result is None or "unwrapped_phase" not in result:
-            continue
-            
-        plt.subplot(n_rows, n_cols, i + 1)
-        
-        # 显示解包裹相位
-        img = plt.imshow(result["unwrapped_phase"], cmap='jet')
-        plt.colorbar(img, label='Phase (rad)')
-        plt.title(f"解包裹方法: {method}")
-    
-    plt.tight_layout()
-    
-    # 如果指定了保存路径，保存图像
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    
-    # 只有在主线程中且需要显示时才调用plt.show()
-    if show_plots:
-        plt.show()
-    else:
-        plt.close()
-
-
 def main():
     """
     主函数，用于命令行测试
@@ -2782,17 +971,14 @@ def main():
     print("单频解包裹模块。请通过UI或其他脚本调用 'process_single_frequency_images' 函数。")
     print("可用的解包裹方法:")
     print("  - quality_guided: 原始质量引导解包裹")
-    print("  - improved_quality_guided: 改进的质量引导解包裹")
+    print("  - improved_quality_guided: 改进的质量引导解包裹（推荐）")
     print("  - robust: 鲁棒的相位解包裹")
     print("  - three_step_optimized: 三步相移专用解包裹")
     print("\n掩膜功能:")
     print("  - use_mask: 是否使用投影区域掩膜（默认True）")
-    print("  - mask_method: 掩膜生成方法 ('otsu', 'adaptive', 'relative')")
+    print("  - mask_method: 掩膜生成方法（固定为 'otsu'）")
     print("  - min_area: 最小连通区域面积（默认500）")
-    print("  - mask_confidence: 掩膜置信度阈值（0.1-0.9，默认0.5）")
-    print("     * 0.1-0.3: 宽松掩膜，包含更多区域但可能有噪声")
-    print("     * 0.4-0.6: 推荐范围，平衡的掩膜质量")
-    print("     * 0.7-0.9: 严格掩膜，只包含高置信度区域")
+    print("  - mask_confidence: 掩膜置信度阈值（0.1-0.9，对Otsu方法影响较小）")
 
 
 if __name__ == '__main__':
