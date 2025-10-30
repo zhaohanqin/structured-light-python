@@ -795,11 +795,162 @@ def visualize_combined_3d_surface(h_unwrapped: np.ndarray,
     )
 
 
+def save_for_reconstruction(output_base_dir: str, direction: str, unwrapped_phase: np.ndarray, 
+                           quality_map: np.ndarray, images: List[np.ndarray], mask: np.ndarray) -> None:
+    """
+    保存三维重建所需的数据到 for_reconstruction 文件夹
+    
+    参数:
+        output_base_dir: 输出基础目录（horizontal/vertical的父目录）
+        direction: 条纹方向 ('horizontal' 或 'vertical')
+        unwrapped_phase: 解包裹相位图
+        quality_map: 相位质量图
+        images: 原始相移图像列表（用于计算调制度和强度）
+        mask: 投影区域掩膜
+    
+    注意:
+        - horizontal条纹 → 产生垂直方向相位 → 保存为 phase_vertical.npy
+        - vertical条纹 → 产生水平方向相位 → 保存为 phase_horizontal.npy
+    """
+    # 创建 for_reconstruction 文件夹
+    recon_folder = os.path.join(output_base_dir, 'for_reconstruction')
+    os.makedirs(recon_folder, exist_ok=True)
+    
+    # 确定物理方向命名（条纹方向与相位方向垂直）
+    if direction == 'horizontal':
+        # 水平条纹产生垂直方向的相位变化
+        phase_name = 'phase_vertical.npy'
+        modulation_name = 'modulation_vertical.npy'
+        intensity_name = 'intensity_vertical.npy'
+        physical_direction = '垂直'
+    elif direction == 'vertical':
+        # 垂直条纹产生水平方向的相位变化
+        phase_name = 'phase_horizontal.npy'
+        modulation_name = 'modulation_horizontal.npy'
+        intensity_name = 'intensity_horizontal.npy'
+        physical_direction = '水平'
+    else:
+        raise ValueError(f"未知的方向: {direction}，应为 'horizontal' 或 'vertical'")
+    
+    # 保存相位数据
+    phase_path = os.path.join(recon_folder, phase_name)
+    np.save(phase_path, unwrapped_phase)
+    print(f"  ✓ 已保存{physical_direction}方向相位: {phase_path}")
+    
+    # 计算并保存调制度和平均强度（3个频率的形式，这里只有1个频率，所以复制3次以保持格式兼容）
+    # 计算调制度
+    n = len(images)
+    float_images = [img.astype(np.float32) for img in images]
+    avg_intensity = sum(float_images) / n
+    
+    delta = 2 * np.pi / n
+    sin_sum = 0
+    cos_sum = 0
+    for i in range(n):
+        phase_shift = i * delta
+        sin_sum += float_images[i] * np.sin(phase_shift)
+        cos_sum += float_images[i] * np.cos(phase_shift)
+    
+    # 调制幅度
+    modulation_single = np.sqrt(sin_sum**2 + cos_sum**2) * (2 / n)
+    
+    # 计算调制度 (调制幅度除以平均强度)
+    eps = 1e-10
+    modulation = modulation_single / (avg_intensity + eps)
+    modulation[~mask] = 0  # 掩膜外区域设为0
+    
+    # 为了与三频系统保持格式兼容，将单频数据扩展为3个频率的形式
+    # 通常单频系统只有1个频率，这里将相同数据复制3次
+    modulation_3freq = np.stack([modulation, modulation, modulation], axis=2)
+    intensity_3freq = np.stack([avg_intensity, avg_intensity, avg_intensity], axis=2)
+    
+    # 保存调制度
+    modulation_path = os.path.join(recon_folder, modulation_name)
+    np.save(modulation_path, modulation_3freq)
+    print(f"  ✓ 已保存{physical_direction}方向调制度: {modulation_path}")
+    
+    # 保存平均强度
+    intensity_path = os.path.join(recon_folder, intensity_name)
+    np.save(intensity_path, intensity_3freq)
+    print(f"  ✓ 已保存{physical_direction}方向平均强度: {intensity_path}")
+    
+    # 检查是否两个方向都已保存，如果是则创建README
+    phase_h_exists = os.path.exists(os.path.join(recon_folder, 'phase_horizontal.npy'))
+    phase_v_exists = os.path.exists(os.path.join(recon_folder, 'phase_vertical.npy'))
+    
+    if phase_h_exists and phase_v_exists:
+        # 读取两个方向的相位以生成README
+        phase_h = np.load(os.path.join(recon_folder, 'phase_horizontal.npy'))
+        phase_v = np.load(os.path.join(recon_folder, 'phase_vertical.npy'))
+        
+        readme_path = os.path.join(recon_folder, 'README.txt')
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write("="*70 + "\n")
+            f.write("三维重建所需数据说明（单频解包裹系统）\n")
+            f.write("="*70 + "\n\n")
+            
+            f.write("【数据文件】\n")
+            f.write("-"*70 + "\n")
+            f.write("✅ phase_horizontal.npy  - 水平方向绝对相位 (必需)\n")
+            f.write("✅ phase_vertical.npy    - 垂直方向绝对相位 (必需)\n")
+            f.write("⭐ modulation_horizontal.npy - 水平方向调制度 (H, W, 3) (推荐)\n")
+            f.write("⭐ modulation_vertical.npy   - 垂直方向调制度 (H, W, 3) (推荐)\n")
+            f.write("⭐ intensity_horizontal.npy  - 水平方向平均强度 (H, W, 3) (推荐)\n")
+            f.write("⭐ intensity_vertical.npy    - 垂直方向平均强度 (H, W, 3) (推荐)\n")
+            f.write("\n")
+            
+            f.write("【重要说明】\n")
+            f.write("-"*70 + "\n")
+            f.write("✨ 文件命名直接反映相位的物理方向，无需额外映射！\n\n")
+            f.write("  - phase_horizontal.npy：水平方向相位（from 垂直条纹）\n")
+            f.write("  - phase_vertical.npy：垂直方向相位（from 水平条纹）\n\n")
+            f.write("  原理：水平条纹产生垂直相位变化，垂直条纹产生水平相位变化\n\n")
+            
+            f.write("在三维重建工具中的使用：\n")
+            f.write("   phase_h = np.load('phase_horizontal.npy')  # 直接使用！\n")
+            f.write("   phase_v = np.load('phase_vertical.npy')    # 直接使用！\n\n")
+            
+            f.write("【数据信息】\n")
+            f.write("-"*70 + "\n")
+            f.write(f"图像尺寸: {phase_h.shape[1]} × {phase_h.shape[0]} 像素\n")
+            f.write(f"相位解包裹方法: 单频质量引导解包裹\n")
+            f.write(f"\n水平方向相位范围: [{phase_h.min():.3f}, {phase_h.max():.3f}] rad\n")
+            f.write(f"垂直方向相位范围: [{phase_v.min():.3f}, {phase_v.max():.3f}] rad\n")
+            
+            # 计算等效周期数
+            h_periods = (phase_h.max() - phase_h.min()) / (2 * np.pi)
+            v_periods = (phase_v.max() - phase_v.min()) / (2 * np.pi)
+            f.write(f"\n水平方向等效周期数: {h_periods:.2f}\n")
+            f.write(f"垂直方向等效周期数: {v_periods:.2f}\n\n")
+            
+            f.write("【使用方法】\n")
+            f.write("-"*70 + "\n")
+            f.write("在三维重建工具.py中配置：\n\n")
+            f.write("config = {\n")
+            f.write(f"    'phase_folder': r'{os.path.abspath(output_base_dir)}',\n")
+            f.write("    'calibration_file': './标定结果.txt',\n")
+            f.write("    'output_file': 'pointCloud.ply',\n")
+            f.write("    # ... 其他参数\n")
+            f.write("}\n\n")
+            f.write("然后运行: python 三维重建工具.py\n\n")
+            
+            f.write("【注意事项】\n")
+            f.write("-"*70 + "\n")
+            f.write("1. 相位值单位为弧度（rad），范围不限于[0,2π]，可以有多个周期\n")
+            f.write("2. 在三维重建中，相位通过 up = phase_h/(2π)*1920 转换为投影仪坐标\n")
+            f.write("3. 调制度用于质量过滤，值越高表示该点的相位测量越可靠\n")
+            f.write("4. 如果点云质量不佳，可以调整质量过滤参数（modulation_threshold等）\n\n")
+        
+        print(f"  ✓ 已创建README文件: {readme_path}")
+        print(f"\n📁 三维重建数据已完整保存到: {recon_folder}")
+
+
 def process_single_frequency_images(image_paths: List[str], output_dir: str, method: str, show_plots: bool = True, 
                                   use_mask: bool = True, mask_method: str = 'otsu', min_area: int = 500, 
                                   mask_confidence: float = 0.5,
                                   use_shared_mask: bool = True,
-                                  shared_mask_name: str = 'mask/final_mask.png') -> Optional[Dict[str, np.ndarray]]:
+                                  shared_mask_name: str = 'mask/final_mask.png',
+                                  direction: Optional[str] = None) -> Optional[Dict[str, np.ndarray]]:
     """
     处理单频条纹图像，执行完整的解包裹流程
     
@@ -812,8 +963,17 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
         mask_method: 掩膜生成方法 ('otsu', 'adaptive', 'relative')
         min_area: 最小连通区域面积
         mask_confidence: 掩膜置信度阈值 (0.1-0.9)
+        use_shared_mask: 是否使用共享掩膜
+        shared_mask_name: 共享掩膜文件名
+        direction: 条纹方向 ('horizontal' 或 'vertical')，可选。
+                  如果不指定，程序会自动从 output_dir 路径中检测
     
     返回一个包含解包裹相位和包裹相位的字典，或者在失败时返回 None
+    
+    注意:
+        - 会自动生成 for_reconstruction 文件夹用于三维重建
+        - 相位会被归一化到 [0, 2π] 范围
+        - 如果 output_dir 包含 'horizontal' 或 'vertical'，会自动检测方向
     """
     if not image_paths:
         print("错误: 未提供图像文件路径。")
@@ -938,6 +1098,55 @@ def process_single_frequency_images(image_paths: List[str], output_dir: str, met
     
     # 不再在方向文件夹中生成 wrapped/quality/3D 可视化图
 
+    # 保存三维重建所需的数据（归一化到 [0, 2π] 范围）
+    # 自动从 output_dir 路径中推断方向
+    if direction is None:
+        # 尝试从路径中自动推断方向
+        output_dir_lower = output_dir.lower().replace('\\', '/')
+        if 'horizontal' in output_dir_lower:
+            direction = 'horizontal'
+            print("  自动检测到：水平条纹方向")
+        elif 'vertical' in output_dir_lower:
+            direction = 'vertical'
+            print("  自动检测到：垂直条纹方向")
+    
+    if direction is not None:
+        print(f"\n保存三维重建数据（{direction} 方向）...")
+        try:
+            # 归一化解包裹相位到 [0, 2π] 范围（与三频系统保持一致）
+            unwrapped_phase_normalized = unwrapped_phase.copy()
+            if np.any(mask):
+                masked_phase = unwrapped_phase_normalized[mask]
+                phase_min = np.min(masked_phase)
+                phase_max = np.max(masked_phase)
+                phase_range = phase_max - phase_min
+                
+                if phase_range > 0:
+                    # 归一化到 [0, 1]，再缩放到 [0, 2π]
+                    unwrapped_phase_normalized[mask] = (masked_phase - phase_min) / phase_range * (2 * np.pi)
+                    print(f"  相位归一化: [{phase_min:.3f}, {phase_max:.3f}] rad ({phase_range/(2*np.pi):.2f}周期) -> [0, {2*np.pi:.3f}] rad")
+                else:
+                    unwrapped_phase_normalized[mask] = 0
+                    print(f"  警告: 相位范围为0，所有掩膜内像素设为0")
+            
+            # output_dir 是当前方向的文件夹（例如 .../horizontal），需要获取父目录
+            output_base_dir = os.path.abspath(os.path.join(output_dir, os.pardir))
+            save_for_reconstruction(
+                output_base_dir=output_base_dir,
+                direction=direction,
+                unwrapped_phase=unwrapped_phase_normalized,  # 使用归一化后的相位
+                quality_map=quality_map,
+                images=images,
+                mask=mask
+            )
+        except Exception as e:
+            print(f"保存三维重建数据时出错: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("⚠️ 提示: 无法自动检测条纹方向，未保存三维重建数据")
+        print("   提示：输出路径中应包含 'horizontal' 或 'vertical' 关键词")
+
     return {
         "unwrapped_phase": unwrapped_phase,
         "wrapped_phase": wrapped_phase
@@ -970,15 +1179,20 @@ def main():
     
     print("单频解包裹模块。请通过UI或其他脚本调用 'process_single_frequency_images' 函数。")
     print("可用的解包裹方法:")
-    print("  - quality_guided: 原始质量引导解包裹")
-    print("  - improved_quality_guided: 改进的质量引导解包裹（推荐）")
+    print("  - quality_guided: 质量引导解包裹（推荐）")
     print("  - robust: 鲁棒的相位解包裹")
-    print("  - three_step_optimized: 三步相移专用解包裹")
     print("\n掩膜功能:")
     print("  - use_mask: 是否使用投影区域掩膜（默认True）")
     print("  - mask_method: 掩膜生成方法（固定为 'otsu'）")
     print("  - min_area: 最小连通区域面积（默认500）")
     print("  - mask_confidence: 掩膜置信度阈值（0.1-0.9，对Otsu方法影响较小）")
+    print("\n三维重建数据输出:")
+    print("  - 自动从输出路径检测方向（horizontal/vertical）")
+    print("  - 自动生成 for_reconstruction/ 文件夹，包含：")
+    print("    * 归一化到 [0, 2π] 的相位图")
+    print("    * 调制度和平均强度数据")
+    print("    * 与三频系统兼容的数据格式")
+    print("  - 提示：输出路径应包含 'horizontal' 或 'vertical' 关键词")
 
 
 if __name__ == '__main__':
